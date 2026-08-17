@@ -1,0 +1,161 @@
+import Foundation
+import Combine
+import UIKit
+
+@MainActor
+final class AppState: ObservableObject {
+    @Published private(set) var serverURL: URL?
+    @Published private(set) var token: String?
+    @Published var isCheckingSession = true
+    @Published var sessionMessage: String?
+    @Published private(set) var lastEvent: NativeEvent?
+    @Published private(set) var isRealtimeConnected = false
+    @Published private(set) var pendingConversationID: String?
+
+    private let serverKey = "nativeServerURL"
+    private var eventTask: Task<Void, Never>?
+
+    init() {
+        if let value = UserDefaults.standard.string(forKey: serverKey) {
+            serverURL = URL(string: value)
+        }
+        token = KeychainStore.loadToken()
+    }
+
+    var client: APIClient? {
+        guard let serverURL else { return nil }
+        return APIClient(baseURL: serverURL, token: token)
+    }
+
+    func bootstrap() async {
+        defer { isCheckingSession = false }
+        guard serverURL != nil, token != nil, let client else { return }
+        do {
+            try await client.checkSession()
+            sessionMessage = nil
+            startEventStream()
+        } catch {
+            if case AppClientError.unauthorized = error {
+                clearToken()
+                sessionMessage = error.localizedDescription
+            } else {
+                // 临时断网不能把有效登录清掉。保留 token，进入会话页后自动重连。
+                sessionMessage = "暂时无法连接服务器，网络恢复后会自动重试"
+                startEventStream()
+            }
+        }
+    }
+
+    func configureServer(_ input: String) async throws {
+        let normalized = try Self.normalizeServer(input)
+        let probeClient = APIClient(baseURL: normalized, token: nil)
+        try await probeClient.probe()
+        serverURL = normalized
+        UserDefaults.standard.set(normalized.absoluteString, forKey: serverKey)
+        clearToken()
+        sessionMessage = nil
+    }
+
+    func login(username: String, password: String) async throws {
+        guard let serverURL else { throw AppClientError.invalidServer }
+        let response = try await APIClient(baseURL: serverURL, token: nil)
+            .login(username: username, password: password)
+        token = response.token
+        KeychainStore.saveToken(response.token)
+        sessionMessage = nil
+        startEventStream()
+    }
+
+    func logout() async {
+        if let client { try? await client.logout() }
+        clearToken()
+    }
+
+    func forgetServer() {
+        clearToken()
+        serverURL = nil
+        sessionMessage = nil
+        UserDefaults.standard.removeObject(forKey: serverKey)
+    }
+
+    func handleUnauthorized(_ error: Error) {
+        if case AppClientError.unauthorized = error {
+            clearToken()
+            sessionMessage = error.localizedDescription
+        }
+    }
+
+    func handleDeepLink(_ url: URL) {
+        guard url.scheme?.lowercased() == "servicedesk",
+              url.host?.lowercased() == "conversation" else { return }
+        let conversationID = url.path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .removingPercentEncoding ?? ""
+        guard !conversationID.isEmpty else { return }
+        pendingConversationID = conversationID
+    }
+
+    func consumeConversationDeepLink(_ conversationID: String) {
+        guard pendingConversationID == conversationID else { return }
+        pendingConversationID = nil
+    }
+
+    private func startEventStream() {
+        eventTask?.cancel()
+        guard let client, token != nil else { return }
+
+        eventTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    for try await event in client.eventStream() {
+                        guard let self, !Task.isCancelled else { return }
+                        if event.type == "connected" {
+                            isRealtimeConnected = true
+                            sessionMessage = nil
+                        } else {
+                            lastEvent = event
+                            if event.type == "new_message", event.message?.sender == "visitor" {
+                                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            }
+                        }
+                    }
+                } catch {
+                    guard let self, !Task.isCancelled else { return }
+                    isRealtimeConnected = false
+                    if case AppClientError.unauthorized = error {
+                        clearToken()
+                        sessionMessage = error.localizedDescription
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                }
+            }
+        }
+    }
+
+    private func clearToken() {
+        eventTask?.cancel()
+        eventTask = nil
+        isRealtimeConnected = false
+        lastEvent = nil
+        token = nil
+        KeychainStore.deleteToken()
+    }
+
+    static func normalizeServer(_ input: String) throws -> URL {
+        var value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.lowercased().hasPrefix("https://") {
+            value = "https://" + value
+        }
+        guard var components = URLComponents(string: value),
+              components.scheme?.lowercased() == "https",
+              components.host != nil else {
+            throw AppClientError.invalidServer
+        }
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else { throw AppClientError.invalidServer }
+        return url
+    }
+}

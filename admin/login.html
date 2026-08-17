@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>登录 - 客服台</title>
+<meta name="color-scheme" content="light dark" />
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#F4F5F7" />
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<style>
+  html, body { background: #F4F5F7; }
+  @media (prefers-color-scheme: dark) {
+    html, body { background: #000000 !important; }
+  }
+</style>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="login-wrap">
+    <form id="login-form" class="login-card">
+      <h1>客服台</h1>
+      <p class="hint">请登录后管理会话</p>
+      <input id="login-username" placeholder="用户名" autocomplete="username" />
+      <input id="login-password" type="password" placeholder="密码" autocomplete="current-password" />
+      <div id="login-error"></div>
+      <button type="submit" class="primary" id="login-submit">登录</button>
+    </form>
+  </div>
+
+  <script>
+    (function () {
+      var isStandalone = window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+      if (!isStandalone) return;
+      document.documentElement.classList.add('ms-standalone');
+      function measure() {
+        var h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+        document.documentElement.style.setProperty('--ms-app-h', h + 'px');
+      }
+      measure();
+      window.addEventListener('resize', measure);
+      window.addEventListener('pageshow', measure);
+      if (window.visualViewport) window.visualViewport.addEventListener('resize', measure);
+      setTimeout(measure, 100);
+      setTimeout(measure, 400);
+      setTimeout(measure, 1000);
+    })();
+    const form = document.getElementById('login-form');
+    const errEl = document.getElementById('login-error');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errEl.textContent = '';
+      const username = document.getElementById('login-username').value.trim();
+      const password = document.getElementById('login-password').value;
+      const btn = document.getElementById('login-submit');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ username, password })
+        });
+        if (res.ok) {
+          const data = await res.json().catch(() => ({}));
+          if (data.token) localStorage.setItem('ms_token', data.token);
+          location.replace('index.html');
+        } else {
+          const data = await res.json().catch(() => ({}));
+          errEl.textContent = data.error || '登录失败';
+        }
+      } catch (err) {
+        errEl.textContent = '网络错误，请重试';
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

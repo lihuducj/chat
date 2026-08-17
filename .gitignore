@@ -1,0 +1,11 @@
+server/data.sqlite
+server/data.sqlite-shm
+server/data.sqlite-wal
+server/uploads/*
+!server/uploads/.gitkeep
+node_modules/
+.DS_Store
+DerivedData/
+ios/output/
+*.xcarchive
+*.ipa

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>客服台</title>
+<meta name="color-scheme" content="light dark" />
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#F4F5F7" />
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<style>
+  /* 内联样式，不依赖外部style.css文件加载完成——避免加载瞬间背景色还没确定，
+     这个短暂的窗口期如果正好被第三方输入法(搜狗等)撞上，会导致输入法深浅色状态判断错乱、
+     需要手动切换一次输入法才能恢复。深浅两种模式都要立即锁定背景色，不能只处理一种。 */
+  html, body { background: #F4F5F7; }
+  @media (prefers-color-scheme: dark) {
+    html, body { background: #000000 !important; }
+  }
+</style>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div id="sidebar-head">
+        <span class="dot" id="conn-dot"></span>
+        <h1>客服台</h1>
+        <button id="sound-toggle-btn" title="声音提醒">🔊</button>
+        <button id="menu-manage-btn" title="聊天菜单管理">📋</button>
+        <button id="settings-btn" title="设置">⚙</button>
+        <button id="logout-btn" title="退出登录">⏻</button>
+      </div>
+      <div id="sidebar-search">
+        <input id="search-input" placeholder="搜索访客、邮箱、消息内容…" />
+      </div>
+      <div id="conv-list"></div>
+    </aside>
+
+    <main id="chat-pane">
+      <div id="empty-state">
+        <p>选择左侧会话开始回复</p>
+      </div>
+      <div id="chat-active" style="display:none">
+        <header id="chat-head">
+          <div class="chat-head-top">
+            <button id="back-btn" title="返回列表">←</button>
+            <div class="chat-visitor-info">
+              <div id="chat-visitor-name">—</div>
+              <div id="chat-visitor-url">—</div>
+            </div>
+            <button id="meta-toggle-btn" title="备注与标签">🏷</button>
+          </div>
+          <div id="typing-indicator">对方正在输入…</div>
+          <div id="meta-panel" style="display:none">
+            <div id="tag-chips"></div>
+            <input id="tag-input" placeholder="输入标签后回车添加" />
+            <textarea id="notes-input" placeholder="内部备注（仅自己可见）" rows="2"></textarea>
+          </div>
+        </header>
+        <div id="chat-messages"></div>
+        <footer id="chat-inputbar">
+          <div id="quote-bar">
+            <span id="quote-bar-text"></span>
+            <button id="quote-bar-close" title="取消引用">✕</button>
+          </div>
+          <div id="chat-inputbar-row">
+            <button id="attach-btn" class="round-icon-btn" title="发送文件">📎</button>
+            <button id="canned-btn" class="round-icon-btn" title="常用语">💬</button>
+            <div id="chat-input-wrap">
+              <textarea id="chat-input" placeholder="写点什么" autocomplete="off" rows="1"></textarea>
+              <button id="emoji-btn" title="表情">😊</button>
+            </div>
+            <button id="send-btn" class="round-icon-btn" title="发送">➤</button>
+            <input id="file-input" type="file" style="display:none" />
+          </div>
+        </footer>
+        <div id="canned-popup" style="display:none">
+          <div id="canned-list"></div>
+          <button id="canned-manage-btn">管理常用语…</button>
+        </div>
+        <div id="emoji-popup" style="display:none"></div>
+      </div>
+    </main>
+  </div>
+
+  <div id="image-lightbox" style="display:none">
+    <img id="image-lightbox-img" src="" alt="" />
+    <button id="image-lightbox-close" title="关闭">✕</button>
+  </div>
+
+  <div id="settings-modal" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <h2>设置</h2>
+
+      <div class="modal-section-title">推送</div>
+      <label>Bark 推送地址（如 https://api.day.app/你的Key）</label>
+      <input id="bark-url-input" placeholder="https://api.day.app/xxxxxxxx" />
+      <p class="hint">客服离线时，新访客消息会通过 Bark 推送到你的 iPhone。</p>
+
+      <label>浏览器/App原生推送</label>
+      <button id="webpush-toggle-btn" type="button" style="width:100%;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:9px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">检查中…</button>
+      <p class="hint">开启后点击通知会直接跳转到对应会话，不经过第三方。iOS需要先"添加到主屏幕"才能使用。</p>
+      <label>当前登记的推送订阅（每次重新"添加到主屏幕"后重新开启推送，都会多一条，建议只保留最新那一条，其余的删掉）</label>
+      <div id="push-sub-list" style="font-size:12px;color:var(--muted);margin-bottom:12px"></div>
+
+      <label>最近推送记录（成功/失败都会记，方便回查某条消息到底有没有真的推送出去）</label>
+      <div id="push-log-list" style="font-size:12px;color:var(--muted);margin-bottom:12px;max-height:200px;overflow-y:auto"></div>
+
+      <div class="modal-section-title">聊天窗外观</div>
+      <label>窗口标题</label>
+      <input id="widget-title-input" placeholder="在线客服" />
+
+      <label>主色 / 悬浮按钮标签</label>
+      <div class="color-row">
+        <input type="color" id="widget-color-input" value="#6D5DFB" />
+        <input type="color" id="widget-color2-input" value="#3B82F6" />
+        <span class="hint" style="margin:0">渐变起止色，两个选一样就是纯色</span>
+      </div>
+
+      <label>悬浮按钮竖排文字（留空则不显示标签）</label>
+      <input id="widget-launcher-input" placeholder="点我联系客服" />
+
+      <label>访客首次打开的欢迎语（留空则不显示）</label>
+      <input id="widget-welcome-input" placeholder="你好呀，有什么可以帮你的？" />
+
+      <div class="modal-actions">
+        <button id="settings-cancel">取消</button>
+        <button id="settings-save" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="canned-modal" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <h2>常用语管理</h2>
+      <div id="canned-manage-list"></div>
+      <div class="modal-section-title">新增常用语</div>
+      <label>标题（方便你自己识别）</label>
+      <input id="canned-new-title" placeholder="例如：欢迎语" />
+      <label>内容</label>
+      <input id="canned-new-content" placeholder="您好，请问有什么可以帮您？" />
+      <div class="modal-actions">
+        <button id="canned-add-btn" class="primary">添加</button>
+      </div>
+      <div class="modal-actions">
+        <button id="canned-modal-close">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="menu-modal" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <h2>聊天菜单管理</h2>
+      <p class="hint">客户第一次打开聊天窗、还没有任何聊天记录时，会自动看到顶层菜单。"留空内容"的项点击后进入子菜单，"填了内容"的项点击后直接显示这段文字（不会再有子项）。</p>
+      <div id="menu-manage-list"></div>
+      <div class="modal-section-title" id="menu-form-title">新增菜单项</div>
+      <label>上级菜单（不选就是顶层菜单项）</label>
+      <select id="menu-new-parent"><option value="">（顶层）</option></select>
+      <label>标题</label>
+      <input id="menu-new-title" placeholder="例如：发卡问题" />
+      <label>内容（留空 = 这是个菜单，点了进下一层；填了 = 点击直接显示这段文字）</label>
+      <textarea id="menu-new-content" rows="3" placeholder="留空即可，除非这是最终要展示给客户看的教程/答案文字"></textarea>
+      <div class="modal-actions">
+        <button id="menu-cancel-edit-btn" style="display:none">取消编辑</button>
+        <button id="menu-add-btn" class="primary">添加</button>
+      </div>
+      <div class="modal-actions">
+        <button id="menu-modal-close">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
