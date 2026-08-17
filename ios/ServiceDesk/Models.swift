@@ -130,7 +130,7 @@ struct UploadResponse: Decodable {
     let type: String
 }
 
-struct CannedReply: Identifiable, Decodable {
+struct CannedReply: Identifiable, Codable, Hashable {
     let id: String
     let title: String
     let content: String
@@ -139,6 +139,32 @@ struct CannedReply: Identifiable, Decodable {
     enum CodingKeys: String, CodingKey {
         case id, title, content
         case createdAt = "created_at"
+    }
+}
+
+struct WidgetMenuItem: Identifiable, Codable, Hashable {
+    let id: String
+    let parentId: String?
+    let title: String
+    let content: String?
+    let sortOrder: Int
+    let createdAt: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, content
+        case parentId = "parent_id"
+        case sortOrder = "sort_order"
+        case createdAt = "created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        parentId = try values.decodeIfPresent(String.self, forKey: .parentId)
+        title = try values.decodeIfPresent(String.self, forKey: .title) ?? ""
+        content = try values.decodeIfPresent(String.self, forKey: .content)
+        sortOrder = try values.decodeIfPresent(Int.self, forKey: .sortOrder) ?? 0
+        createdAt = try values.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
     }
 }
 

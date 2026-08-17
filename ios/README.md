@@ -10,7 +10,10 @@
 - 处理中 / 未读 / 已结束筛选，左滑结束或重新打开会话
 - 原生聊天气泡和时间戳
 - 发送文字、照片、相机图片和文件
-- 常用语、会话标签、内部备注、消息撤回、删除会话
+- 常用语管理、会话标签、内部备注、引用回复、消息撤回、删除会话
+- 原生管理客户插件的标题、渐变颜色、竖排文字、欢迎语和多层聊天菜单
+- iOS 18 以上可选系统自动翻译客户文字（原文仍保留；iOS 16/17 正常聊天但不显示该功能）
+- App 前台客户新消息提示音，可在设置中关闭；会话列表实时显示未读数字
 - 无 APNs entitlement，适合普通 UDID 证书和 Feather 重签安装
 - App 前台由 SSE 实时刷新，后台和锁屏由 Bark 提醒
 - SSE 实时消息流，断线自动重连，15 秒安全兜底
@@ -22,14 +25,15 @@
 
 ## 必须先更新服务器
 
-原生 App 使用 API v2 和 SSE 实时事件流。生成 IPA 前或安装后，都必须把新版 `server/server.js` 和 `server/db.js` 覆盖到 VPS，然后执行：
+原生 App 使用 API v2 和 SSE 实时事件流。生成 IPA 前或安装后，都必须把新版 `server/` 与 `admin/` 覆盖到 VPS。本版还更新了 Multer、Express 和 Socket.IO 安全依赖，因此需要执行：
 
 ```bash
 cd /srv/chat/server
+npm ci --omit=dev
 pm2 restart myservice --update-env
 ```
 
-如果你的实际目录不同，请换成真实路径。数据库表会由 `server/db.js` 自动升级，无需手工执行 SQL，也无需重新 `npm install`。
+如果你的实际目录不同，请换成真实路径。数据库表会由 `server/db.js` 自动升级，无需手工执行 SQL。
 
 可以在服务器上验证接口是否已更新：未登录执行下面命令应返回 `unauthorized`，而不是 `Cannot POST`：
 
@@ -88,7 +92,7 @@ location = /api/native/events {
 
 1. 把整个 `customer-service` 文件夹上传到自己的 GitHub 仓库。
 2. 打开 Actions → `Build unsigned iOS IPA` → Run workflow。
-3. 下载 `ServiceDesk-unsigned-ipa` artifact，解压得到 `ServiceDesk-unsigned.ipa`。
+3. 下载 `ServiceDesk-1.3.0-unsigned-ipa` artifact，解压得到 `ServiceDesk-unsigned.ipa`。
 4. 用自己的签名工具重签并安装。
 
 未签名 IPA 不能直接安装。免费 Apple ID 签名通常需要定期续签，具体有效期由 Apple 账号和签名工具决定。
@@ -109,4 +113,4 @@ chat.example.com
 
 此版本不包含 APNs entitlement。App 在前台时通过 SSE 立即收消息；切到后台、锁屏或被系统清理后由 Bark 提醒。必须在 App 设置中保存 Bark 地址，否则后台没有系统通知。
 
-PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。
+PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。当前版本号为 1.3.0（build 6）。

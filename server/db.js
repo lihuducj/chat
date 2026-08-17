@@ -3,10 +3,14 @@ const path = require('path');
 
 const db = new Database(path.join(__dirname, 'data.sqlite'));
 db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+db.pragma('busy_timeout = 5000');
+db.pragma('foreign_keys = ON');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS visitors (
   id TEXT PRIMARY KEY,
+  visitor_secret TEXT,
   name TEXT,
   email TEXT,
   ip TEXT,
@@ -100,6 +104,14 @@ try {
   db.prepare('SELECT email FROM visitors LIMIT 1').get();
 } catch (e) {
   db.exec('ALTER TABLE visitors ADD COLUMN email TEXT');
+}
+
+// 访客身份不能只依赖可复制/可猜测的 visitorId。随机 secret 只保存在该访客浏览器里，
+// 服务端用两者共同验证历史会话归属。老数据库启动时自动补字段，旧访客下次连接时再安全生成。
+try {
+  db.prepare('SELECT visitor_secret FROM visitors LIMIT 1').get();
+} catch (e) {
+  db.exec('ALTER TABLE visitors ADD COLUMN visitor_secret TEXT');
 }
 
 // 兼容旧数据库：conversations表补上 notes / tags

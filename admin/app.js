@@ -1037,7 +1037,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   const fd = new FormData();
   fd.append('file', f);
   try {
-    const res = await fetch(SERVER + '/api/upload', { method: 'POST', body: fd });
+    const res = await fetch(SERVER + '/api/upload', { method: 'POST', headers: authHeaders(), body: fd });
     const data = await res.json();
     if (!res.ok) {
       alert(data.error || '上传失败');

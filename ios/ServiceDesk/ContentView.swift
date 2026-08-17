@@ -3,6 +3,9 @@ import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
 import Combine
+#if canImport(Translation)
+import Translation
+#endif
 
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
@@ -477,6 +480,7 @@ private struct ChatView: View {
     @State private var showDetails = false
     @State private var visitorIsTyping = false
     @State private var pendingRecall: ChatMessage?
+    @State private var quotedText: String?
     @State private var previewImageURL: URL?
     @State private var typingTask: Task<Void, Never>?
     @State private var typingHideTask: Task<Void, Never>?
@@ -503,10 +507,14 @@ private struct ChatView: View {
                                     message: message,
                                     client: appState.client,
                                     receipt: receiptText(for: message),
-                                    onImageTap: { previewImageURL = $0 }
-                                ) {
-                                    pendingRecall = message
-                                }
+                                    autoTranslate: appState.autoTranslateEnabled && !message.isAgent,
+                                    onImageTap: { previewImageURL = $0 },
+                                    onQuote: {
+                                        quotedText = message.content
+                                        composerFocused = true
+                                    },
+                                    onRecall: { pendingRecall = message }
+                                )
                                 .id(message.id)
                             }
                         }
@@ -542,6 +550,28 @@ private struct ChatView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 14)
                 .padding(.top, 5)
+            }
+
+            if let quotedText {
+                HStack(spacing: 8) {
+                    Rectangle()
+                        .fill(Color.blue)
+                        .frame(width: 3, height: 34)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("引用回复").font(.caption.bold()).foregroundStyle(.blue)
+                        Text(quotedText.replacingOccurrences(of: "\n", with: " "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button { self.quotedText = nil } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color(uiColor: .secondarySystemBackground))
             }
 
             HStack(alignment: .bottom, spacing: 10) {
@@ -712,19 +742,22 @@ private struct ChatView: View {
     private func sendText() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let client = appState.client else { return }
+        let quote = quotedText
+        let outgoingText = quote.map { "「\($0)」\n\(text)" } ?? text
         let localId = "local-\(UUID().uuidString)"
         let pending = ChatMessage(
             id: localId,
             conversationId: conversation.id,
             sender: "agent",
             type: "text",
-            content: text,
+            content: outgoingText,
             fileName: nil,
             fileSize: nil,
             createdAt: Int64(Date().timeIntervalSince1970 * 1000),
             recalled: 0
         )
         draft = ""
+        quotedText = nil
         messages.append(pending)
         isSending = true
         Task {
@@ -733,7 +766,7 @@ private struct ChatView: View {
                 let message = try await client.sendMessage(
                     conversationId: conversation.id,
                     type: "text",
-                    content: text
+                    content: outgoingText
                 )
                 messages.removeAll { $0.id == localId }
                 if !messages.contains(where: { $0.id == message.id }) {
@@ -745,6 +778,7 @@ private struct ChatView: View {
             } catch {
                 messages.removeAll { $0.id == localId }
                 draft = text
+                quotedText = quote
                 appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
@@ -976,7 +1010,9 @@ private struct MessageBubble: View {
     let message: ChatMessage
     let client: APIClient?
     let receipt: String?
+    let autoTranslate: Bool
     let onImageTap: (URL) -> Void
+    let onQuote: () -> Void
     let onRecall: () -> Void
 
     var body: some View {
@@ -1016,8 +1052,17 @@ private struct MessageBubble: View {
                             }
                         }
                     } else {
+                        #if canImport(Translation)
+                        if #available(iOS 18.0, *), autoTranslate {
+                            AutoTranslatedMessageText(text: message.content)
+                        } else {
+                            Text(message.content)
+                                .textSelection(.enabled)
+                        }
+                        #else
                         Text(message.content)
                             .textSelection(.enabled)
+                        #endif
                     }
                 }
                 .padding(message.type == "image" && !message.isRecalled ? 0 : 10)
@@ -1038,6 +1083,9 @@ private struct MessageBubble: View {
             }
             .contextMenu {
                 if message.type == "text" && !message.isRecalled {
+                    Button(action: onQuote) {
+                        Label("引用回复", systemImage: "arrowshape.turn.up.left")
+                    }
                     Button {
                         UIPasteboard.general.string = message.content
                     } label: {
@@ -1055,6 +1103,47 @@ private struct MessageBubble: View {
         }
     }
 }
+
+#if canImport(Translation)
+@available(iOS 18.0, *)
+private struct AutoTranslatedMessageText: View {
+    let text: String
+    @State private var translatedText: String?
+    @State private var configuration: TranslationSession.Configuration?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(text).textSelection(.enabled)
+            if let translatedText, translatedText != text {
+                Divider()
+                HStack(alignment: .top, spacing: 5) {
+                    Image(systemName: "translate")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                    Text(translatedText)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .task {
+            if configuration == nil {
+                configuration = TranslationSession.Configuration(
+                    source: nil,
+                    target: Locale.Language(identifier: "zh-Hans")
+                )
+            }
+        }
+        .translationTask(configuration) { session in
+            do {
+                let response = try await session.translate(text)
+                translatedText = response.targetText
+            } catch {
+                translatedText = nil
+            }
+        }
+    }
+}
+#endif
 
 private struct ImagePreviewView: View {
     @Environment(\.dismiss) private var dismiss
@@ -1236,6 +1325,45 @@ private struct NativeSettingsView: View {
                         dismiss()
                     }
                 }
+                Section("客户聊天插件") {
+                    NavigationLink {
+                        WidgetAppearanceSettingsView()
+                    } label: {
+                        Label("外观与欢迎语", systemImage: "paintpalette")
+                    }
+                    NavigationLink {
+                        WidgetMenuSettingsView()
+                    } label: {
+                        Label("聊天菜单", systemImage: "list.bullet.rectangle")
+                    }
+                    NavigationLink {
+                        CannedReplyManagementView()
+                    } label: {
+                        Label("常用语管理", systemImage: "text.bubble")
+                    }
+                }
+                Section("消息提醒") {
+                    Toggle(
+                        "APP 前台新消息提示音",
+                        isOn: Binding(
+                            get: { appState.foregroundSoundEnabled },
+                            set: { appState.setForegroundSoundEnabled($0) }
+                        )
+                    )
+                    Toggle(
+                        "自动翻译客户文字",
+                        isOn: Binding(
+                            get: { appState.autoTranslateEnabled },
+                            set: { appState.setAutoTranslateEnabled($0) }
+                        )
+                    )
+                    .disabled(!supportsNativeTranslation)
+                    if !supportsNativeTranslation {
+                        Text("自动翻译需要 iOS 18 或更高版本。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Section {
                     TextField("https://api.day.app/你的Key", text: $barkURL)
                         .textInputAutocapitalization(.never)
@@ -1292,4 +1420,483 @@ private struct NativeSettingsView: View {
         }
     }
 
+    private var supportsNativeTranslation: Bool {
+        if #available(iOS 18.0, *) { return true }
+        return false
+    }
+
+}
+
+private struct WidgetAppearanceSettingsView: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var title = "在线客服"
+    @State private var launcherText = "点我联系客服"
+    @State private var welcomeMessage = "你好呀，有什么可以帮你的？"
+    @State private var primaryColor = Color(hexRGB: "#6D5DFB")
+    @State private var secondaryColor = Color(hexRGB: "#3B82F6")
+    @State private var isLoading = true
+    @State private var isSaving = false
+    @State private var message: String?
+
+    var body: some View {
+        Form {
+            Section("实时预览") {
+                VStack(spacing: 10) {
+                    Text(title.isEmpty ? "在线客服" : title)
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Text(welcomeMessage.isEmpty ? "欢迎语已隐藏" : welcomeMessage)
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.9))
+                    Text(launcherText.isEmpty ? "不显示竖排文字" : launcherText)
+                        .font(.caption)
+                        .foregroundStyle(.white)
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(
+                    LinearGradient(
+                        colors: [primaryColor, secondaryColor],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 14)
+                )
+            }
+
+            Section("文字") {
+                TextField("窗口标题", text: $title)
+                TextField("悬浮按钮竖排文字（可留空）", text: $launcherText)
+                TextField("访客首次打开的欢迎语（可留空）", text: $welcomeMessage, axis: .vertical)
+                    .lineLimit(2...5)
+            }
+
+            Section("颜色") {
+                ColorPicker("渐变起始色", selection: $primaryColor, supportsOpacity: false)
+                ColorPicker("渐变结束色", selection: $secondaryColor, supportsOpacity: false)
+                Text("两个颜色设成相同就是纯色。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let message {
+                Section { Text(message).foregroundStyle(.secondary) }
+            }
+        }
+        .navigationTitle("插件外观")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button(isSaving ? "保存中…" : "保存") { save() }
+                    .disabled(isSaving || isLoading || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .task { await load() }
+    }
+
+    private func load() async {
+        do {
+            let settings = try await appState.client?.settings() ?? [:]
+            title = settings["widget_title"] ?? "在线客服"
+            launcherText = settings["widget_launcher_text"] ?? "点我联系客服"
+            welcomeMessage = settings["widget_welcome_message"] ?? "你好呀，有什么可以帮你的？"
+            primaryColor = Color(hexRGB: settings["widget_color"] ?? "#6D5DFB")
+            secondaryColor = Color(hexRGB: settings["widget_color2"] ?? "#3B82F6")
+            message = nil
+        } catch {
+            message = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func save() {
+        isSaving = true
+        message = nil
+        Task {
+            do {
+                try await appState.client?.saveSettings([
+                    "widget_title": title.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "widget_color": primaryColor.hexRGB,
+                    "widget_color2": secondaryColor.hexRGB,
+                    "widget_launcher_text": launcherText.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "widget_welcome_message": welcomeMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                ])
+                message = "已保存，访客刷新网页后生效"
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } catch {
+                message = error.localizedDescription
+            }
+            isSaving = false
+        }
+    }
+}
+
+private extension Color {
+    init(hexRGB: String) {
+        let value = hexRGB.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var number: UInt64 = 0
+        Scanner(string: value).scanHexInt64(&number)
+        guard value.count == 6 else {
+            self = .blue
+            return
+        }
+        self.init(
+            red: Double((number >> 16) & 0xff) / 255,
+            green: Double((number >> 8) & 0xff) / 255,
+            blue: Double(number & 0xff) / 255
+        )
+    }
+
+    var hexRGB: String {
+        let color = UIColor(self)
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        guard color.getRed(&red, green: &green, blue: &blue, alpha: &alpha) else { return "#6D5DFB" }
+        return String(format: "#%02X%02X%02X", Int(red * 255), Int(green * 255), Int(blue * 255))
+    }
+}
+
+private struct CannedReplyEditorContext: Identifiable {
+    let id = UUID()
+    let reply: CannedReply?
+}
+
+private struct CannedReplyManagementView: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var replies: [CannedReply] = []
+    @State private var editor: CannedReplyEditorContext?
+    @State private var errorMessage: String?
+    @State private var isLoading = true
+
+    var body: some View {
+        List {
+            ForEach(replies) { reply in
+                Button { editor = CannedReplyEditorContext(reply: reply) } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(reply.title).font(.headline)
+                        Text(reply.content).foregroundStyle(.secondary).lineLimit(3)
+                    }
+                }
+                .buttonStyle(.plain)
+                .swipeActions {
+                    Button("删除", role: .destructive) { delete(reply) }
+                }
+            }
+        }
+        .overlay {
+            if isLoading { ProgressView() }
+            else if replies.isEmpty { Text(errorMessage ?? "暂无常用语").foregroundStyle(.secondary) }
+        }
+        .navigationTitle("常用语管理")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button { editor = CannedReplyEditorContext(reply: nil) } label: {
+                    Image(systemName: "plus")
+                }
+            }
+        }
+        .sheet(item: $editor) { context in
+            CannedReplyEditorView(reply: context.reply) {
+                Task { await load() }
+            }
+        }
+        .task { await load() }
+    }
+
+    private func load() async {
+        do {
+            replies = try await appState.client?.cannedReplies() ?? []
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func delete(_ reply: CannedReply) {
+        Task {
+            do {
+                try await appState.client?.deleteCannedReply(id: reply.id)
+                replies.removeAll { $0.id == reply.id }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct CannedReplyEditorView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+    let reply: CannedReply?
+    let onSaved: () -> Void
+    @State private var title: String
+    @State private var content: String
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(reply: CannedReply?, onSaved: @escaping () -> Void) {
+        self.reply = reply
+        self.onSaved = onSaved
+        _title = State(initialValue: reply?.title ?? "")
+        _content = State(initialValue: reply?.content ?? "")
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("标题") { TextField("例如：售后说明", text: $title) }
+                Section("回复内容") { TextEditor(text: $content).frame(minHeight: 160) }
+                if let errorMessage { Section { Text(errorMessage).foregroundStyle(.red) } }
+            }
+            .navigationTitle(reply == nil ? "新增常用语" : "编辑常用语")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isSaving ? "保存中…" : "保存") { save() }
+                        .disabled(isSaving || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func save() {
+        isSaving = true
+        Task {
+            do {
+                let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let cleanContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let reply {
+                    try await appState.client?.updateCannedReply(id: reply.id, title: cleanTitle, content: cleanContent)
+                } else {
+                    _ = try await appState.client?.createCannedReply(title: cleanTitle, content: cleanContent)
+                }
+                onSaved()
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            isSaving = false
+        }
+    }
+}
+
+private struct WidgetMenuEditorContext: Identifiable {
+    let id = UUID()
+    let item: WidgetMenuItem?
+}
+
+private struct WidgetMenuRow: Identifiable {
+    let item: WidgetMenuItem
+    let depth: Int
+    var id: String { item.id }
+}
+
+private struct WidgetMenuSettingsView: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var items: [WidgetMenuItem] = []
+    @State private var editor: WidgetMenuEditorContext?
+    @State private var errorMessage: String?
+    @State private var isLoading = true
+
+    private var rows: [WidgetMenuRow] {
+        var output: [WidgetMenuRow] = []
+        var visited = Set<String>()
+        func appendChildren(of parentID: String?, depth: Int) {
+            items
+                .filter { $0.parentId == parentID }
+                .sorted { $0.sortOrder == $1.sortOrder ? $0.createdAt < $1.createdAt : $0.sortOrder < $1.sortOrder }
+                .forEach { item in
+                    guard visited.insert(item.id).inserted else { return }
+                    output.append(WidgetMenuRow(item: item, depth: depth))
+                    appendChildren(of: item.id, depth: depth + 1)
+                }
+        }
+        appendChildren(of: nil, depth: 0)
+        items.filter { !visited.contains($0.id) }.forEach { output.append(WidgetMenuRow(item: $0, depth: 0)) }
+        return output
+    }
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(rows) { row in
+                    Button { editor = WidgetMenuEditorContext(item: row.item) } label: {
+                        HStack(alignment: .top, spacing: 8) {
+                            if row.depth > 0 {
+                                Image(systemName: "arrow.turn.down.right")
+                                    .foregroundStyle(.secondary)
+                            }
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(row.item.title).font(.headline)
+                                Text((row.item.content ?? "").isEmpty ? "子菜单" : row.item.content ?? "")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .padding(.leading, CGFloat(row.depth) * 14)
+                    }
+                    .buttonStyle(.plain)
+                    .swipeActions {
+                        Button("删除", role: .destructive) { delete(row.item) }
+                    }
+                }
+            } footer: {
+                Text("内容留空表示这是一个可继续展开的菜单；填写内容表示客户点击后直接看到答案。")
+            }
+        }
+        .overlay {
+            if isLoading { ProgressView() }
+            else if items.isEmpty { Text(errorMessage ?? "暂无聊天菜单").foregroundStyle(.secondary) }
+        }
+        .navigationTitle("聊天菜单")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button { editor = WidgetMenuEditorContext(item: nil) } label: {
+                    Image(systemName: "plus")
+                }
+            }
+        }
+        .sheet(item: $editor) { context in
+            WidgetMenuEditorView(allItems: items, item: context.item) {
+                Task { await load() }
+            }
+        }
+        .task { await load() }
+    }
+
+    private func load() async {
+        do {
+            items = try await appState.client?.menuItems() ?? []
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func delete(_ item: WidgetMenuItem) {
+        Task {
+            do {
+                try await appState.client?.deleteMenuItem(id: item.id)
+                await load()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct WidgetMenuEditorView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+    let allItems: [WidgetMenuItem]
+    let item: WidgetMenuItem?
+    let onSaved: () -> Void
+    @State private var parentID: String?
+    @State private var title: String
+    @State private var content: String
+    @State private var sortOrder: Int
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(allItems: [WidgetMenuItem], item: WidgetMenuItem?, onSaved: @escaping () -> Void) {
+        self.allItems = allItems
+        self.item = item
+        self.onSaved = onSaved
+        _parentID = State(initialValue: item?.parentId)
+        _title = State(initialValue: item?.title ?? "")
+        _content = State(initialValue: item?.content ?? "")
+        _sortOrder = State(initialValue: item?.sortOrder ?? 0)
+    }
+
+    private var parentCandidates: [WidgetMenuItem] {
+        let blocked = descendantIDs(of: item?.id)
+        return allItems
+            .filter { ($0.content ?? "").isEmpty && $0.id != item?.id && !blocked.contains($0.id) }
+            .sorted { $0.sortOrder == $1.sortOrder ? $0.createdAt < $1.createdAt : $0.sortOrder < $1.sortOrder }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("位置") {
+                    Picker("上级菜单", selection: $parentID) {
+                        Text("顶级菜单").tag(nil as String?)
+                        ForEach(parentCandidates) { candidate in
+                            Text(candidate.title).tag(Optional(candidate.id))
+                        }
+                    }
+                    Stepper("排序：\(sortOrder)", value: $sortOrder, in: 0...999)
+                }
+                Section("标题") { TextField("例如：发卡问题", text: $title) }
+                Section {
+                    TextEditor(text: $content).frame(minHeight: 140)
+                } header: {
+                    Text("点击后显示的内容")
+                } footer: {
+                    Text("留空表示这是一个子菜单入口；填写后表示这是最终答案。")
+                }
+                if let errorMessage { Section { Text(errorMessage).foregroundStyle(.red) } }
+            }
+            .navigationTitle(item == nil ? "新增菜单项" : "编辑菜单项")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isSaving ? "保存中…" : "保存") { save() }
+                        .disabled(isSaving || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func descendantIDs(of rootID: String?) -> Set<String> {
+        guard let rootID else { return [] }
+        var result = Set<String>()
+        var queue = [rootID]
+        while let parent = queue.popLast() {
+            for child in allItems where child.parentId == parent && result.insert(child.id).inserted {
+                queue.append(child.id)
+            }
+        }
+        return result
+    }
+
+    private func save() {
+        isSaving = true
+        Task {
+            do {
+                let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let cleanContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let item {
+                    try await appState.client?.updateMenuItem(
+                        id: item.id,
+                        parentId: parentID,
+                        title: cleanTitle,
+                        content: cleanContent,
+                        sortOrder: sortOrder
+                    )
+                } else {
+                    _ = try await appState.client?.createMenuItem(
+                        parentId: parentID,
+                        title: cleanTitle,
+                        content: cleanContent,
+                        sortOrder: sortOrder
+                    )
+                }
+                onSaved()
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            isSaving = false
+        }
+    }
 }

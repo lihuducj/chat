@@ -35,6 +35,10 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
+  function safeColor(value, fallback) {
+    value = String(value || '');
+    return /^#[0-9A-Fa-f]{6}$/.test(value) ? value : fallback;
+  }
 
   function run() {
   var CONFIG = window.MYSERVICE_CONFIG || {};
@@ -58,12 +62,12 @@
 
   function init(remote) {
   // 优先级：嵌入代码里显式配置 > 后台"设置"里保存的外观 > 默认值
-  var PRIMARY = CONFIG.color || remote.color || '#6D5DFB';
-  var SECONDARY = CONFIG.color2 || remote.color2 || PRIMARY;
+  var PRIMARY = safeColor(CONFIG.color || remote.color, '#6D5DFB');
+  var SECONDARY = safeColor(CONFIG.color2 || remote.color2, PRIMARY);
   var GRADIENT = 'linear-gradient(160deg, ' + PRIMARY + ', ' + SECONDARY + ')';
-  var LAUNCHER_TEXT = CONFIG.launcherText != null ? CONFIG.launcherText : (remote.launcherText != null ? remote.launcherText : '点我联系客服');
-  var WELCOME_MESSAGE = CONFIG.welcomeMessage != null ? CONFIG.welcomeMessage : (remote.welcomeMessage != null ? remote.welcomeMessage : '');
-  var TITLE = CONFIG.title || remote.title || '在线客服';
+  var LAUNCHER_TEXT = String(CONFIG.launcherText != null ? CONFIG.launcherText : (remote.launcherText != null ? remote.launcherText : '点我联系客服')).slice(0, 40);
+  var WELCOME_MESSAGE = String(CONFIG.welcomeMessage != null ? CONFIG.welcomeMessage : (remote.welcomeMessage != null ? remote.welcomeMessage : '')).slice(0, 500);
+  var TITLE = String(CONFIG.title || remote.title || '在线客服').slice(0, 80);
   var MENU_TREE = Array.isArray(remote.menu) ? remote.menu : [];
 
   var STORAGE_KEY = 'myservice_visitor';
@@ -183,7 +187,7 @@
   // ---------- DOM：悬浮按钮（含可选竖排标签） ----------
   var launcher = document.createElement('div');
   launcher.id = 'ms-launcher';
-  var tagHtml = LAUNCHER_TEXT ? '<div id="ms-tag">' + LAUNCHER_TEXT + '</div>' : '';
+  var tagHtml = LAUNCHER_TEXT ? '<div id="ms-tag">' + escapeHtml(LAUNCHER_TEXT) + '</div>' : '';
   launcher.innerHTML = tagHtml +
     '<div id="ms-btn"><svg viewBox="0 0 24 24"><path d="M4 4h16v12H7l-3 3V4z"/></svg><div id="ms-badge">0</div></div>';
   document.body.appendChild(launcher);
@@ -195,7 +199,7 @@
   panel.id = 'ms-panel';
   panel.innerHTML = `
     <div id="ms-header">
-      <span>${TITLE}</span>
+      <span>${escapeHtml(TITLE)}</span>
       <button id="ms-theme-toggle" title="切换深浅色">🌙</button>
       <button id="ms-collapse-btn" title="收起"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     </div>
@@ -706,6 +710,7 @@
       query: {
         role: 'visitor',
         visitorId: stored.visitorId || '',
+        visitorSecret: stored.visitorSecret || '',
         conversationId: stored.conversationId || '',
         email: stored.email || '',
         url: location.href
@@ -725,16 +730,9 @@
 
     socket.on('session_info', function (data) {
       stored.visitorId = data.visitorId;
+      stored.visitorSecret = data.visitorSecret;
       stored.conversationId = data.conversationId;
       safeSet(STORAGE_KEY, JSON.stringify(stored));
-    });
-
-    // 邮箱认领成功：换成老访客的身份，刷新一下页面重新连接，就能看到完整历史记录了
-    socket.on('visitor_matched', function (data) {
-      stored.visitorId = data.visitorId;
-      stored.conversationId = data.conversationId;
-      safeSet(STORAGE_KEY, JSON.stringify(stored));
-      location.reload();
     });
 
     socket.on('history', function (msgs) {
@@ -811,7 +809,14 @@
       if (!f) return;
       var fd = new FormData();
       fd.append('file', f);
-      fetch(SERVER + '/api/upload', { method: 'POST', body: fd })
+      fetch(SERVER + '/api/upload', {
+        method: 'POST',
+        headers: {
+          'X-Visitor-Id': stored.visitorId || '',
+          'X-Visitor-Secret': stored.visitorSecret || ''
+        },
+        body: fd
+      })
         .then(function (r) { return r.json().then(function (data) { return { ok: r.ok, data: data }; }); })
         .then(function (result) {
           if (!result.ok) {

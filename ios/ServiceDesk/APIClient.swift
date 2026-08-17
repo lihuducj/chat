@@ -102,6 +102,59 @@ struct APIClient {
         try await request(path: "/api/canned-replies")
     }
 
+    func createCannedReply(title: String, content: String) async throws -> CannedReply {
+        let body = try JSONSerialization.data(withJSONObject: ["title": title, "content": content])
+        return try await request(path: "/api/canned-replies", method: "POST", body: body)
+    }
+
+    func updateCannedReply(id: String, title: String, content: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["title": title, "content": content])
+        let _: APIStatus = try await request(
+            path: "/api/canned-replies/\(escaped(id))",
+            method: "PUT",
+            body: body
+        )
+    }
+
+    func deleteCannedReply(id: String) async throws {
+        let _: APIStatus = try await request(path: "/api/canned-replies/\(escaped(id))", method: "DELETE")
+    }
+
+    func menuItems() async throws -> [WidgetMenuItem] {
+        try await request(path: "/api/menu-items")
+    }
+
+    func createMenuItem(parentId: String?, title: String, content: String, sortOrder: Int) async throws -> WidgetMenuItem {
+        var payload: [String: Any] = [
+            "title": title,
+            "content": content,
+            "sortOrder": sortOrder
+        ]
+        if let parentId { payload["parentId"] = parentId }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        return try await request(path: "/api/menu-items", method: "POST", body: body)
+    }
+
+    func updateMenuItem(id: String, parentId: String?, title: String, content: String, sortOrder: Int) async throws {
+        var payload: [String: Any] = [
+            "title": title,
+            "content": content,
+            "sortOrder": sortOrder
+        ]
+        if let parentId { payload["parentId"] = parentId }
+        else { payload["parentId"] = NSNull() }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let _: APIStatus = try await request(
+            path: "/api/menu-items/\(escaped(id))",
+            method: "PUT",
+            body: body
+        )
+    }
+
+    func deleteMenuItem(id: String) async throws {
+        let _: APIStatus = try await request(path: "/api/menu-items/\(escaped(id))", method: "DELETE")
+    }
+
     func settings() async throws -> [String: String] {
         try await request(path: "/api/settings")
     }

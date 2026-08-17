@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UIKit
+import AudioToolbox
 
 @MainActor
 final class AppState: ObservableObject {
@@ -11,11 +12,17 @@ final class AppState: ObservableObject {
     @Published private(set) var lastEvent: NativeEvent?
     @Published private(set) var isRealtimeConnected = false
     @Published private(set) var pendingConversationID: String?
+    @Published private(set) var foregroundSoundEnabled: Bool
+    @Published private(set) var autoTranslateEnabled: Bool
 
     private let serverKey = "nativeServerURL"
+    private let foregroundSoundKey = "nativeForegroundSoundEnabled"
+    private let autoTranslateKey = "nativeAutoTranslateEnabled"
     private var eventTask: Task<Void, Never>?
 
     init() {
+        foregroundSoundEnabled = UserDefaults.standard.object(forKey: foregroundSoundKey) as? Bool ?? true
+        autoTranslateEnabled = UserDefaults.standard.bool(forKey: autoTranslateKey)
         if let value = UserDefaults.standard.string(forKey: serverKey) {
             serverURL = URL(string: value)
         }
@@ -100,6 +107,16 @@ final class AppState: ObservableObject {
         pendingConversationID = nil
     }
 
+    func setForegroundSoundEnabled(_ enabled: Bool) {
+        foregroundSoundEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: foregroundSoundKey)
+    }
+
+    func setAutoTranslateEnabled(_ enabled: Bool) {
+        autoTranslateEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: autoTranslateKey)
+    }
+
     private func startEventStream() {
         eventTask?.cancel()
         guard let client, token != nil else { return }
@@ -115,6 +132,9 @@ final class AppState: ObservableObject {
                         } else {
                             lastEvent = event
                             if event.type == "new_message", event.message?.sender == "visitor" {
+                                if foregroundSoundEnabled {
+                                    AudioServicesPlaySystemSound(1007)
+                                }
                                 UINotificationFeedbackGenerator().notificationOccurred(.success)
                             }
                         }

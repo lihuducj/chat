@@ -19,10 +19,16 @@ app.set('trust proxy', true); // 部署在Nginx/宝塔反代后面，这样req.i
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   next();
 });
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, {
+  cors: { origin: '*' },
+  maxHttpBufferSize: 64 * 1024,
+  perMessageDeflate: false
+});
 
 const PORT = process.env.PORT || 4000;
 const ADMIN_PATH = (process.env.ADMIN_PATH || 'admin').replace(/^\/|\/$/g, '');
@@ -55,17 +61,38 @@ if (!ADMIN_USERNAME || !ADMIN_PASSWORD) {
   console.warn('⚠️  未在 .env 中配置 ADMIN_USERNAME / ADMIN_PASSWORD，管理后台登录将始终失败，请先配置。');
 }
 
-// 安全网：任何没预料到的异常，只记日志不让整个进程崩掉。
-// 这样即使某个边缘情况有bug漏网，也只是这一次操作失败，不会导致所有人同时断线。
+// 未捕获异常后继续运行可能留下损坏状态。记录日志后让 PM2 拉起全新进程，
+// SQLite/WAL 会保留已经提交的数据；正常停止则先关闭监听和数据库。
+let shuttingDown = false;
+function gracefulShutdown(exitCode) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const forceExit = setTimeout(() => process.exit(exitCode), 5000);
+  forceExit.unref();
+  server.close(() => {
+    try { db.close(); } catch (e) {}
+    process.exit(exitCode);
+  });
+}
 process.on('uncaughtException', (err) => {
-  console.error('❌ 未捕获的异常(服务继续运行):', err);
+  console.error('❌ 未捕获的异常，正在安全重启:', err);
+  gracefulShutdown(1);
 });
 process.on('unhandledRejection', (err) => {
-  console.error('❌ 未处理的Promise错误(服务继续运行):', err);
+  console.error('❌ 未处理的 Promise 错误，正在安全重启:', err);
+  gracefulShutdown(1);
 });
+process.on('SIGTERM', () => gracefulShutdown(0));
+process.on('SIGINT', () => gracefulShutdown(0));
 
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+// widget 需要被不同域名的网站引用，但我们不允许跨站请求携带后台 Cookie。
+// 原生 App/管理后台使用 Authorization，访客上传使用独立 visitor secret。
+app.use(cors({
+  origin: true,
+  credentials: false,
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Visitor-Id', 'X-Visitor-Secret']
+}));
+app.use(express.json({ limit: '128kb' }));
 app.use(cookieParser());
 app.use('/widget.js', express.static(path.join(__dirname, 'public', 'widget.js')));
 
@@ -126,6 +153,28 @@ function requireAuth(req, res, next) {
     return next();
   }
   return res.status(401).json({ error: 'unauthorized' });
+}
+
+function cleanText(value, maxLength) {
+  return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
+}
+
+function isSafeId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(value);
+}
+
+function hasValidVisitorIdentity(visitorId, visitorSecret) {
+  if (!isSafeId(visitorId) || !isSafeId(visitorSecret)) return false;
+  const row = db.prepare('SELECT visitor_secret FROM visitors WHERE id = ?').get(visitorId);
+  return Boolean(row && row.visitor_secret && row.visitor_secret === visitorSecret);
+}
+
+function requireUploadIdentity(req, res, next) {
+  if (isValidSession(getTokenFromReq(req))) return next();
+  const visitorId = req.get('X-Visitor-Id') || '';
+  const visitorSecret = req.get('X-Visitor-Secret') || '';
+  if (hasValidVisitorIdentity(visitorId, visitorSecret)) return next();
+  return res.status(401).json({ error: '上传身份已失效，请刷新聊天窗口后重试' });
 }
 
 // ---------- 原生 App 实时事件流（SSE） ----------
@@ -235,7 +284,7 @@ const ALLOWED_EXTENSIONS = new Set([
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
+    const ext = path.extname(file.originalname).toLowerCase();
     cb(null, `${nanoid()}${ext}`);
   }
 });
@@ -251,12 +300,12 @@ const upload = multer({
   }
 });
 
-app.post('/api/upload', (req, res) => {
+app.post('/api/upload', requireUploadIdentity, (req, res) => {
   const ip = req.ip || 'unknown';
   const now = Date.now();
   const record = uploadAttempts.get(ip) || [];
   const recent = record.filter((t) => now - t < 5 * 60 * 1000);
-  if (recent.length >= 30) {
+  if (recent.length >= 12) {
     return res.status(429).json({ error: '上传太频繁，请稍后再试' });
   }
   recent.push(now);
@@ -317,7 +366,8 @@ app.get('/api/canned-replies', requireAuth, (req, res) => {
 });
 
 app.post('/api/canned-replies', requireAuth, (req, res) => {
-  const { title, content } = req.body || {};
+  const title = cleanText(req.body && req.body.title, 80);
+  const content = cleanText(req.body && req.body.content, 10000);
   if (!title || !content) return res.status(400).json({ error: 'title/content required' });
   const row = { id: nanoid(), title, content, created_at: Date.now() };
   db.prepare('INSERT INTO canned_replies (id, title, content, created_at) VALUES (@id, @title, @content, @created_at)').run(row);
@@ -325,9 +375,11 @@ app.post('/api/canned-replies', requireAuth, (req, res) => {
 });
 
 app.put('/api/canned-replies/:id', requireAuth, (req, res) => {
-  const { title, content } = req.body || {};
+  const title = req.body && req.body.title !== undefined ? cleanText(req.body.title, 80) : null;
+  const content = req.body && req.body.content !== undefined ? cleanText(req.body.content, 10000) : null;
+  if (title === '' || content === '') return res.status(400).json({ error: 'title/content required' });
   db.prepare('UPDATE canned_replies SET title = COALESCE(?, title), content = COALESCE(?, content) WHERE id = ?')
-    .run(title || null, content || null, req.params.id);
+    .run(title, content, req.params.id);
   res.json({ ok: true });
 });
 
@@ -344,13 +396,18 @@ app.get('/api/menu-items', requireAuth, (req, res) => {
 
 app.post('/api/menu-items', requireAuth, (req, res) => {
   const { parentId, title, content, sortOrder } = req.body || {};
-  if (!title) return res.status(400).json({ error: 'title required' });
+  const cleanTitle = cleanText(title, 80);
+  const cleanContent = cleanText(content, 10000);
+  if (!cleanTitle) return res.status(400).json({ error: 'title required' });
+  if (parentId && !db.prepare('SELECT id FROM menu_items WHERE id = ?').get(parentId)) {
+    return res.status(400).json({ error: 'parent not found' });
+  }
   const row = {
     id: nanoid(),
     parent_id: parentId || null,
-    title,
-    content: content || null,
-    sort_order: sortOrder || 0,
+    title: cleanTitle,
+    content: cleanContent || null,
+    sort_order: Number.isFinite(Number(sortOrder)) ? Math.max(-9999, Math.min(9999, Number(sortOrder))) : 0,
     created_at: Date.now()
   };
   db.prepare(`INSERT INTO menu_items (id, parent_id, title, content, sort_order, created_at)
@@ -361,11 +418,15 @@ app.post('/api/menu-items', requireAuth, (req, res) => {
 app.put('/api/menu-items/:id', requireAuth, (req, res) => {
   const { title, content, sortOrder, parentId } = req.body || {};
   const id = req.params.id;
+  const current = db.prepare('SELECT * FROM menu_items WHERE id = ?').get(id);
+  if (!current) return res.status(404).json({ error: 'menu item not found' });
+  if (title !== undefined && !cleanText(title, 80)) return res.status(400).json({ error: 'title required' });
 
   if (parentId !== undefined && parentId !== null) {
     // 防止把一个菜单项的上级设成它自己的子孙，那样会在树形结构里形成死循环
     if (parentId === id) return res.status(400).json({ error: '不能把自己设成自己的上级' });
     let cursor = db.prepare('SELECT parent_id FROM menu_items WHERE id = ?').get(parentId);
+    if (!cursor) return res.status(400).json({ error: 'parent not found' });
     let hops = 0;
     while (cursor && cursor.parent_id && hops < 50) {
       if (cursor.parent_id === id) return res.status(400).json({ error: '不能把子菜单设成自己的上级，会形成循环' });
@@ -380,10 +441,10 @@ app.put('/api/menu-items/:id', requireAuth, (req, res) => {
     sort_order = COALESCE(?, sort_order),
     parent_id = ?
     WHERE id = ?`).run(
-    title || null,
-    content === undefined ? null : content,
-    sortOrder,
-    parentId !== undefined ? (parentId || null) : db.prepare('SELECT parent_id FROM menu_items WHERE id = ?').get(id).parent_id,
+    title === undefined ? null : cleanText(title, 80),
+    content === undefined ? current.content : (cleanText(content, 10000) || null),
+    sortOrder === undefined ? null : Math.max(-9999, Math.min(9999, Number(sortOrder) || 0)),
+    parentId !== undefined ? (parentId || null) : current.parent_id,
     id
   );
   res.json({ ok: true });
@@ -443,6 +504,11 @@ app.post('/api/push/subscribe', requireAuth, (req, res) => {
   if (!sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
     return res.status(400).json({ error: 'invalid subscription' });
   }
+  if (typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || sub.endpoint.length > 2000 ||
+      typeof sub.keys.p256dh !== 'string' || sub.keys.p256dh.length > 512 ||
+      typeof sub.keys.auth !== 'string' || sub.keys.auth.length > 256) {
+    return res.status(400).json({ error: 'invalid subscription' });
+  }
   db.prepare(`INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, created_at)
     VALUES (@id, @endpoint, @p256dh, @auth, @created_at)
     ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`).run({
@@ -466,7 +532,24 @@ app.get('/api/settings', requireAuth, (req, res) => {
 });
 
 app.post('/api/settings', requireAuth, (req, res) => {
-  const entries = Object.entries(req.body || {});
+  const rules = {
+    bark_url: (v) => {
+      const value = cleanText(v, 1000);
+      return value === '' || /^https:\/\//i.test(value) ? value : null;
+    },
+    widget_title: (v) => cleanText(v, 80),
+    widget_color: (v) => /^#[0-9A-Fa-f]{6}$/.test(String(v)) ? String(v).toUpperCase() : null,
+    widget_color2: (v) => /^#[0-9A-Fa-f]{6}$/.test(String(v)) ? String(v).toUpperCase() : null,
+    widget_launcher_text: (v) => cleanText(v, 40),
+    widget_welcome_message: (v) => cleanText(v, 500)
+  };
+  const entries = [];
+  for (const [key, value] of Object.entries(req.body || {})) {
+    if (!rules[key]) return res.status(400).json({ error: `不支持的设置项: ${key}` });
+    const cleaned = rules[key](value);
+    if (cleaned === null) return res.status(400).json({ error: `设置格式错误: ${key}` });
+    entries.push([key, cleaned]);
+  }
   const stmt = db.prepare(
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'
   );
@@ -477,7 +560,7 @@ app.post('/api/settings', requireAuth, (req, res) => {
 
 // ---------- 会话列表 / 历史消息 ----------
 app.get('/api/conversations', requireAuth, (req, res) => {
-  const q = (req.query.q || '').trim();
+  const q = cleanText(req.query.q || '', 100);
   const like = `%${q}%`;
   const rows = q
     ? db.prepare(`
@@ -505,8 +588,8 @@ app.patch('/api/conversations/:id', requireAuth, (req, res) => {
   const { notes, tags, status } = req.body || {};
   const fields = [];
   const params = {};
-  if (notes !== undefined) { fields.push('notes = @notes'); params.notes = notes; }
-  if (tags !== undefined) { fields.push('tags = @tags'); params.tags = tags; }
+  if (notes !== undefined) { fields.push('notes = @notes'); params.notes = cleanText(notes, 5000); }
+  if (tags !== undefined) { fields.push('tags = @tags'); params.tags = cleanText(tags, 1000); }
   if (status !== undefined) {
     if (!['open', 'closed'].includes(status)) return res.status(400).json({ error: 'invalid status' });
     fields.push('status = @status');
@@ -755,7 +838,7 @@ function ensureConversation(vId, convId) {
   }
 }
 
-const MAX_TEXT_LENGTH = 50000; // 正常聊天不可能碰到这个上限，只是防止有人恶意发超大payload攻击服务器
+const MAX_TEXT_LENGTH = 10000;
 const UPLOAD_PATH_RE = /^\/uploads\/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10}$/;
 
 // 服务端二次校验消息内容，不能只信任客户端传来的数据——
@@ -780,7 +863,7 @@ function sanitizeMessagePayload(payload) {
 }
 
 io.on('connection', (socket) => {
-  const { role, visitorId, conversationId, name, email, url } = socket.handshake.query;
+  const { role, visitorId, visitorSecret, conversationId, name, email, url } = socket.handshake.query;
 
   if (role === 'agent') {
     onlineAgents.add(socket.id);
@@ -800,11 +883,15 @@ io.on('connection', (socket) => {
     socket.on('agent_active', () => { activeAgents.add(socket.id); agentLastSeen.set(socket.id, Date.now()); });
     socket.on('agent_heartbeat', () => agentLastSeen.set(socket.id, Date.now()));
 
-    socket.on('join_conversation', (convId) => socket.join(convId));
+    socket.on('join_conversation', (convId) => {
+      if (isSafeId(convId) && db.prepare('SELECT id FROM conversations WHERE id = ?').get(convId)) socket.join(convId);
+    });
 
     socket.on('agent_typing', (payload) => {
       const { conversationId } = payload || {};
-      if (conversationId) io.to(conversationId).emit('agent_typing');
+      if (isSafeId(conversationId) && db.prepare('SELECT id FROM conversations WHERE id = ?').get(conversationId)) {
+        io.to(conversationId).emit('agent_typing');
+      }
     });
 
     socket.on('agent_message', (payload) => {
@@ -824,34 +911,58 @@ io.on('connection', (socket) => {
 
   // ---- 访客端 ----
   if (role === 'visitor') {
-    const vId = visitorId || nanoid();
+    let vId = isSafeId(visitorId) ? visitorId : nanoid();
+    let vSecret = isSafeId(visitorSecret) ? visitorSecret : '';
     const now = Date.now();
 
-    const existingVisitor = db.prepare('SELECT * FROM visitors WHERE id = ?').get(vId);
+    let existingVisitor = db.prepare('SELECT * FROM visitors WHERE id = ?').get(vId);
+    // 已启用 secret 的访客必须同时匹配；不匹配时创建全新匿名身份，绝不返回原历史。
+    // 老数据没有 secret，第一次升级连接时生成并回传一次，之后即进入双重校验。
+    if (existingVisitor && existingVisitor.visitor_secret && existingVisitor.visitor_secret !== vSecret) {
+      vId = nanoid();
+      vSecret = nanoid(40);
+      existingVisitor = null;
+    } else if (existingVisitor && !existingVisitor.visitor_secret) {
+      vSecret = nanoid(40);
+      db.prepare('UPDATE visitors SET visitor_secret = ? WHERE id = ?').run(vSecret, vId);
+      existingVisitor.visitor_secret = vSecret;
+    } else if (!existingVisitor) {
+      vSecret = nanoid(40);
+    }
+
     if (!existingVisitor) {
-      db.prepare(`INSERT INTO visitors (id, name, email, ip, user_agent, first_seen, last_seen, last_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        vId, name || genVisitorLabel(), email || '', socket.handshake.address, socket.handshake.headers['user-agent'] || '', now, now, url || ''
+      db.prepare(`INSERT INTO visitors (id, visitor_secret, name, email, ip, user_agent, first_seen, last_seen, last_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        vId,
+        vSecret,
+        cleanText(name, 80) || genVisitorLabel(),
+        cleanText(email, 254),
+        cleanText(socket.handshake.address, 100),
+        cleanText(socket.handshake.headers['user-agent'] || '', 500),
+        now,
+        now,
+        cleanText(url, 2000)
       );
     } else {
-      db.prepare('UPDATE visitors SET last_seen = ?, last_url = ? WHERE id = ?').run(now, url || '', vId);
+      db.prepare('UPDATE visitors SET last_seen = ?, last_url = ? WHERE id = ?').run(now, cleanText(url, 2000), vId);
       if (email && !existingVisitor.email) {
-        db.prepare('UPDATE visitors SET email = ? WHERE id = ?').run(email, vId);
+        db.prepare('UPDATE visitors SET email = ? WHERE id = ?').run(cleanText(email, 254), vId);
       }
     }
 
-    let convId = conversationId;
-    let conv = convId ? db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId) : null;
+    let convId = isSafeId(conversationId) ? conversationId : '';
+    // 即使有人拿到了别人的 conversationId，也必须归属于已验证的 visitorId 才能恢复历史。
+    let conv = convId ? db.prepare('SELECT * FROM conversations WHERE id = ? AND visitor_id = ?').get(convId, vId) : null;
     if (!conv) {
       conv = db.prepare("SELECT * FROM conversations WHERE visitor_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1").get(vId);
     }
     // 注意：这里不再立即往数据库插入会话记录了——只是先定下这次要用的会话ID，
     // 真正建库要等访客发第一条消息/填联系方式的时候（ensureConversation函数），
     // 不然访客只是打开网页看一眼、什么都没说就走，也会在后台留下一条空会话，显得很乱。
-    convId = conv ? conv.id : (convId || nanoid());
+    convId = conv ? conv.id : nanoid();
 
     socket.join(convId);
-    socket.emit('session_info', { visitorId: vId, conversationId: convId });
+    socket.emit('session_info', { visitorId: vId, visitorSecret: vSecret, conversationId: convId });
 
     // 把历史消息发给访客（重新打开widget时）；如果这个会话还没真正建库，这里自然查出空数组，没问题
     // 已撤回的消息不发给访客，不管是刚撤回还是很久以前撤回的，客户端永远看不到
@@ -859,43 +970,14 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
 
     socket.on('visitor_info', (payload) => {
-      const { name: vName, email: vEmail } = payload || {};
+      const vName = cleanText(payload && payload.name, 80);
+      const vEmail = cleanText(payload && payload.email, 254);
       if (!vName && !vEmail) return;
       ensureConversation(vId, convId);
       db.prepare('UPDATE visitors SET name = COALESCE(NULLIF(?, \'\'), name), email = COALESCE(NULLIF(?, \'\'), email) WHERE id = ?')
         .run(vName || '', vEmail || '', vId);
       io.to('agents').emit('conversation_updated', { conversationId: convId });
       emitNativeEvent('conversation_updated', convId);
-
-      // 邮箱认领：这个邮箱之前在别的会话里出现过的话，把这次访问接到那段历史上，
-      // 客户体验上就像"登录"了一样，能看到之前聊过的内容
-      if (vEmail) {
-        const oldVisitor = db.prepare(
-          'SELECT * FROM visitors WHERE email = ? AND id != ? ORDER BY last_seen DESC LIMIT 1'
-        ).get(vEmail, vId);
-        if (oldVisitor) {
-          const oldConv = db.prepare(
-            'SELECT * FROM conversations WHERE visitor_id = ? ORDER BY created_at DESC LIMIT 1'
-          ).get(oldVisitor.id);
-          if (oldConv) {
-            const msgCount = db.prepare('SELECT COUNT(*) as c FROM messages WHERE conversation_id = ?').get(convId).c;
-            if (msgCount > 0) {
-              // 认领前如果已经发过消息（还没来得及填邮箱），一并合并过去，不丢消息
-              db.prepare('UPDATE messages SET conversation_id = ? WHERE conversation_id = ?').run(oldConv.id, convId);
-              const latest = db.prepare('SELECT MAX(created_at) as t FROM messages WHERE conversation_id = ?').get(oldConv.id).t;
-              db.prepare('UPDATE conversations SET last_message_at = ?, unread_count = unread_count + ? WHERE id = ?')
-                .run(latest || oldConv.last_message_at, msgCount, oldConv.id);
-            }
-            // 清理掉这次新建的、现在已经没用的空会话和访客记录
-            db.prepare('DELETE FROM conversations WHERE id = ?').run(convId);
-            db.prepare('DELETE FROM visitors WHERE id = ?').run(vId);
-
-            socket.emit('visitor_matched', { visitorId: oldVisitor.id, conversationId: oldConv.id });
-            io.to('agents').emit('conversation_updated', { conversationId: oldConv.id });
-            emitNativeEvent('conversation_updated', oldConv.id);
-          }
-        }
-      }
     });
 
     socket.on('visitor_typing', () => {

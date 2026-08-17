@@ -69,10 +69,29 @@ function sleep(ms) {
 
 // 下载Crisp上的附件，重新保存到本地 uploads 目录；失败返回 null
 async function downloadAttachment(url) {
+  let timeout;
   try {
-    const res = await fetch(url);
+    if (!/^https:\/\//i.test(url)) return null;
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), 30000);
+    const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
+    const declaredSize = Number(res.headers.get('content-length') || 0);
+    if (declaredSize > 20 * 1024 * 1024) return null;
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > 20 * 1024 * 1024) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+    const buf = Buffer.concat(chunks, total);
     const extMatch = url.match(/\.([a-zA-Z0-9]{2,5})(\?|$)/);
     const ext = extMatch ? '.' + extMatch[1] : '';
     const filename = `${nanoid()}${ext}`;
@@ -81,6 +100,8 @@ async function downloadAttachment(url) {
   } catch (e) {
     console.warn('  ⚠️ 附件下载失败，保留原链接:', url, e.message);
     return null;
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
@@ -188,8 +209,8 @@ async function run() {
       const firstTs = converted[0].created_at || now;
       const lastTs = converted[converted.length - 1].created_at || now;
 
-      db.prepare(`INSERT OR IGNORE INTO visitors (id, name, email, ip, user_agent, first_seen, last_seen, last_url)
-        VALUES (?, ?, ?, '', '', ?, ?, '')`).run(visitorId, nickname || ('crisp' + Math.floor(100000 + Math.random() * 900000)), email, firstTs, lastTs);
+      db.prepare(`INSERT OR IGNORE INTO visitors (id, visitor_secret, name, email, ip, user_agent, first_seen, last_seen, last_url)
+        VALUES (?, ?, ?, ?, '', '', ?, ?, '')`).run(visitorId, nanoid(40), nickname || ('crisp' + Math.floor(100000 + Math.random() * 900000)), email, firstTs, lastTs);
 
       db.prepare(`INSERT OR IGNORE INTO conversations (id, visitor_id, status, created_at, last_message_at, unread_count, notes, tags)
         VALUES (?, ?, 'closed', ?, ?, 0, ?, ?)`).run(convId, visitorId, firstTs, lastTs, '从Crisp导入', '已导入,Crisp');
