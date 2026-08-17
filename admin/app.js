@@ -51,10 +51,49 @@ const emptyState = document.getElementById('empty-state');
 const chatActive = document.getElementById('chat-active');
 const chatMessages = document.getElementById('chat-messages');
 const chatInput = document.getElementById('chat-input');
+const visitorNameEl = document.getElementById('chat-visitor-name');
+const metaEmailCopyEl = document.getElementById('meta-email-copy');
 document.getElementById('chat-visitor-url').onclick = function () { this.classList.toggle('expanded'); };
 const connDot = document.getElementById('conn-dot');
 const origTitle = document.title;
 let titleFlashTimer = null;
+
+let copyToastTimer = null;
+function showCopyToast(text) {
+  const toast = document.getElementById('copy-toast');
+  toast.textContent = text || '已复制';
+  toast.classList.add('show');
+  clearTimeout(copyToastTimer);
+  copyToastTimer = setTimeout(() => toast.classList.remove('show'), 1500);
+}
+async function copyText(value, successText) {
+  if (!value) return false;
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch (e) {
+    const area = document.createElement('textarea');
+    area.value = value;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand('copy');
+    area.remove();
+    if (!ok) return false;
+  }
+  showCopyToast(successText || '已复制');
+  return true;
+}
+
+visitorNameEl.onclick = function () {
+  const email = this.dataset.email || '';
+  if (email) copyText(email, '邮箱已复制');
+};
+metaEmailCopyEl.onclick = function () {
+  const email = this.dataset.email || '';
+  if (email) copyText(email, '邮箱已复制');
+};
 
 // ---------- 声音提醒 ----------
 const SOUND_MUTED_KEY = 'ms_sound_muted';
@@ -272,7 +311,13 @@ function renderConvList() {
 
 async function openConversation(c) {
   activeConvId = c.id;
-  document.getElementById('chat-visitor-name').textContent = visitorLabel(c);
+  visitorNameEl.textContent = visitorLabel(c);
+  visitorNameEl.dataset.email = c.visitor_email || '';
+  visitorNameEl.classList.toggle('copyable', Boolean(c.visitor_email));
+  visitorNameEl.title = c.visitor_email ? '点击复制邮箱' : '';
+  metaEmailCopyEl.dataset.email = c.visitor_email || '';
+  metaEmailCopyEl.textContent = c.visitor_email ? '邮箱：' + c.visitor_email + '　📋' : '';
+  metaEmailCopyEl.style.display = c.visitor_email ? 'block' : 'none';
   document.getElementById('chat-visitor-url').textContent = c.last_url || '';
   document.getElementById('chat-visitor-url').title = c.last_url || '';
   document.getElementById('chat-visitor-url').classList.remove('expanded'); // 每次切换会话都收起来，别带着上一个会话的展开状态
@@ -934,12 +979,13 @@ function appendMessage(m) {
     if (m.type === 'text' && m.content.length > 40) {
       const copyBtn = document.createElement('button');
       copyBtn.className = 'msg-action-btn';
-      copyBtn.textContent = '复制';
+      copyBtn.textContent = '复制全文';
       copyBtn.onclick = () => {
-        navigator.clipboard.writeText(m.content).then(() => {
+        copyText(m.content).then((ok) => {
+          if (!ok) return;
           copyBtn.textContent = '已复制';
-          setTimeout(() => { copyBtn.textContent = '复制'; }, 1500);
-        }).catch(() => {});
+          setTimeout(() => { copyBtn.textContent = '复制全文'; }, 1500);
+        });
       };
       actions.appendChild(copyBtn);
     }

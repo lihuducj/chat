@@ -481,6 +481,8 @@ private struct ChatView: View {
     @State private var visitorIsTyping = false
     @State private var pendingRecall: ChatMessage?
     @State private var quotedText: String?
+    @State private var selectableText: SelectableTextContext?
+    @State private var copyConfirmation: String?
     @State private var previewImageURL: URL?
     @State private var typingTask: Task<Void, Never>?
     @State private var typingHideTask: Task<Void, Never>?
@@ -512,6 +514,9 @@ private struct ChatView: View {
                                     onQuote: {
                                         quotedText = message.content
                                         composerFocused = true
+                                    },
+                                    onSelectText: {
+                                        selectableText = SelectableTextContext(text: message.content)
                                     },
                                     onRecall: { pendingRecall = message }
                                 )
@@ -631,7 +636,34 @@ private struct ChatView: View {
         }
         .navigationTitle(liveConversation.displayName)
         .navigationBarTitleDisplayMode(.inline)
+        .overlay(alignment: .top) {
+            if let copyConfirmation {
+                Label(copyConfirmation, systemImage: "checkmark.circle.fill")
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.green, in: Capsule())
+                    .padding(.top, 6)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                if let email = liveConversation.visitorEmail, !email.isEmpty {
+                    Button { copyEmail(email) } label: {
+                        HStack(spacing: 5) {
+                            Text(email).lineLimit(1)
+                            Image(systemName: "doc.on.doc").font(.caption2)
+                        }
+                        .font(.headline)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("点按复制邮箱")
+                } else {
+                    Text(liveConversation.displayName).font(.headline).lineLimit(1)
+                }
+            }
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 Button { toggleConversationStatus() } label: {
                     Image(systemName: liveConversation.status == "closed" ? "arrow.uturn.backward.circle" : "checkmark.circle")
@@ -651,6 +683,9 @@ private struct ChatView: View {
         }
         .sheet(isPresented: $showDetails) {
             ConversationDetailsView(conversation: liveConversation)
+        }
+        .sheet(item: $selectableText) { context in
+            PartialTextSelectionView(text: context.text)
         }
         .sheet(
             isPresented: Binding(
@@ -900,6 +935,15 @@ private struct ChatView: View {
         }
     }
 
+    private func copyEmail(_ email: String) {
+        UIPasteboard.general.string = email
+        withAnimation { copyConfirmation = "邮箱已复制" }
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation { copyConfirmation = nil }
+        }
+    }
+
     private func handleRealtimeEvent(_ event: NativeEvent) {
         guard event.conversationId == conversation.id else { return }
         switch event.type {
@@ -1013,6 +1057,7 @@ private struct MessageBubble: View {
     let autoTranslate: Bool
     let onImageTap: (URL) -> Void
     let onQuote: () -> Void
+    let onSelectText: () -> Void
     let onRecall: () -> Void
 
     var body: some View {
@@ -1089,7 +1134,10 @@ private struct MessageBubble: View {
                     Button {
                         UIPasteboard.general.string = message.content
                     } label: {
-                        Label("复制", systemImage: "doc.on.doc")
+                        Label("复制全文", systemImage: "doc.on.doc")
+                    }
+                    Button(action: onSelectText) {
+                        Label("选择部分文字", systemImage: "text.cursor")
                     }
                 }
                 if message.isAgent && !message.isRecalled {
@@ -1101,6 +1149,62 @@ private struct MessageBubble: View {
             .opacity(message.isPending ? 0.65 : 1)
             if !message.isAgent { Spacer(minLength: 48) }
         }
+    }
+}
+
+private struct SelectableTextContext: Identifiable {
+    let id = UUID()
+    let text: String
+}
+
+private struct PartialTextSelectionView: View {
+    @Environment(\.dismiss) private var dismiss
+    let text: String
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("长按文字，拖动蓝色选择点选中需要的部分，再点“复制”。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+                SelectableUITextView(text: text)
+                    .padding(.horizontal, 8)
+            }
+            .padding(.top, 10)
+            .navigationTitle("选择文字")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("复制全文") {
+                        UIPasteboard.general.string = text
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct SelectableUITextView: UIViewRepresentable {
+    let text: String
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.backgroundColor = .clear
+        view.font = .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 20, right: 8)
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if uiView.text != text { uiView.text = text }
     }
 }
 
@@ -1253,6 +1357,7 @@ private struct ConversationDetailsView: View {
     @State private var tags: String
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @State private var copyMessage: String?
 
     init(conversation: Conversation) {
         self.conversation = conversation
@@ -1264,11 +1369,27 @@ private struct ConversationDetailsView: View {
         NavigationStack {
             Form {
                 Section("访客") {
-                    LabeledContent("邮箱", value: conversation.visitorEmail ?? "未填写")
+                    if let email = conversation.visitorEmail, !email.isEmpty {
+                        Button { copyEmail(email) } label: {
+                            HStack {
+                                Text("邮箱").foregroundStyle(.primary)
+                                Spacer()
+                                Text(email).foregroundStyle(.secondary).lineLimit(1)
+                                Image(systemName: "doc.on.doc").foregroundStyle(.blue)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("点按复制邮箱")
+                    } else {
+                        LabeledContent("邮箱", value: "未填写")
+                    }
                     LabeledContent("称呼", value: conversation.visitorName ?? "访客")
                     if let url = conversation.lastUrl, !url.isEmpty {
                         LabeledContent("来源页面", value: url)
                     }
+                }
+                if let copyMessage {
+                    Section { Label(copyMessage, systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
                 }
                 Section("标签") {
                     TextField("多个标签用逗号分隔", text: $tags)
@@ -1304,6 +1425,15 @@ private struct ConversationDetailsView: View {
                 errorMessage = error.localizedDescription
             }
             isSaving = false
+        }
+    }
+
+    private func copyEmail(_ email: String) {
+        UIPasteboard.general.string = email
+        copyMessage = "邮箱已复制"
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            copyMessage = nil
         }
     }
 }
