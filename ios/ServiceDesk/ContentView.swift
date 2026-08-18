@@ -461,6 +461,11 @@ private struct ConversationRow: View {
     }
 }
 
+private enum ComposerPanel: Equatable {
+    case emoji
+    case tools
+}
+
 private struct ChatView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -476,8 +481,7 @@ private struct ChatView: View {
     @State private var showPhotoPicker = false
     @State private var showCamera = false
     @State private var showFileImporter = false
-    @State private var showQuickReplies = false
-    @State private var showEmojiPicker = false
+    @State private var composerPanel: ComposerPanel?
     @State private var showDetails = false
     @State private var visitorIsTyping = false
     @State private var pendingRecall: ChatMessage?
@@ -568,34 +572,12 @@ private struct ChatView: View {
                 .background(Color(uiColor: .secondarySystemBackground))
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
-                Menu {
-                    Button { showPhotoPicker = true } label: {
-                        Label("照片", systemImage: "photo")
-                    }
-                    if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                        Button { showCamera = true } label: {
-                            Label("拍照", systemImage: "camera")
-                        }
-                    }
-                    Button { showFileImporter = true } label: {
-                        Label("文件", systemImage: "doc")
-                    }
-                } label: {
-                    Image(systemName: "plus.circle.fill")
+            HStack(alignment: .bottom, spacing: 8) {
+                Button { toggleComposerPanel(.tools) } label: {
+                    Image(systemName: composerPanel == .tools ? "xmark.circle.fill" : "plus.circle.fill")
                         .font(.system(size: 25))
                 }
-
-                Button { showQuickReplies = true } label: {
-                    Image(systemName: "text.bubble")
-                        .font(.system(size: 22))
-                }
-
-                Button { showEmojiPicker = true } label: {
-                    Image(systemName: "face.smiling")
-                        .font(.system(size: 21))
-                }
-                .accessibilityLabel("表情")
+                .accessibilityLabel(composerPanel == .tools ? "收起功能面板" : "更多功能")
 
                 TextField("输入消息", text: $draft, axis: .vertical)
                     .focused($composerFocused)
@@ -614,6 +596,13 @@ private struct ChatView: View {
                         }
                     }
 
+                Button { toggleComposerPanel(.emoji) } label: {
+                    Image(systemName: composerPanel == .emoji ? "keyboard" : "face.smiling")
+                        .font(.system(size: 22))
+                        .frame(width: 28, height: 34)
+                }
+                .accessibilityLabel(composerPanel == .emoji ? "收起表情面板" : "表情")
+
                 if isSending {
                     ProgressView()
                         .frame(width: 30, height: 30)
@@ -628,7 +617,41 @@ private struct ChatView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .background(.bar)
+
+            if let composerPanel {
+                Group {
+                    switch composerPanel {
+                    case .emoji:
+                        EmojiAccessoryPanel(text: $draft) {
+                            closeComposerPanel()
+                        }
+                    case .tools:
+                        ToolsAccessoryPanel(
+                            cameraAvailable: UIImagePickerController.isSourceTypeAvailable(.camera),
+                            onCamera: {
+                                closeComposerPanel()
+                                showCamera = true
+                            },
+                            onPhotos: {
+                                closeComposerPanel()
+                                showPhotoPicker = true
+                            },
+                            onFile: {
+                                closeComposerPanel()
+                                showFileImporter = true
+                            },
+                            onQuickReply: { content in
+                                draft = content
+                            },
+                            onClose: closeComposerPanel
+                        )
+                    }
+                }
+                .frame(height: 220)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: composerPanel)
         .navigationTitle(liveConversation.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .overlay(alignment: .top) {
@@ -684,20 +707,6 @@ private struct ChatView: View {
                 }
             }
         }
-        .sheet(isPresented: $showQuickReplies) {
-            QuickRepliesView { content in
-                draft = content
-                showQuickReplies = false
-                DispatchQueue.main.async { composerFocused = true }
-            }
-        }
-        .sheet(isPresented: $showEmojiPicker, onDismiss: {
-            DispatchQueue.main.async { composerFocused = true }
-        }) {
-            EmojiPickerView(text: $draft)
-                .presentationDetents([.medium])
-                .presentationDragIndicator(.visible)
-        }
         .sheet(isPresented: $showDetails) {
             ConversationDetailsView(conversation: liveConversation)
         }
@@ -731,6 +740,13 @@ private struct ChatView: View {
         .onChange(of: photoItem) { item in
             guard let item else { return }
             uploadPhoto(item)
+        }
+        .onChange(of: composerFocused) { isFocused in
+            if isFocused, composerPanel != nil {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    composerPanel = nil
+                }
+            }
         }
         .confirmationDialog(
             "撤回这条消息？",
@@ -768,6 +784,19 @@ private struct ChatView: View {
                 guard !Task.isCancelled else { break }
                 await loadMessages(showError: false)
             }
+        }
+    }
+
+    private func toggleComposerPanel(_ panel: ComposerPanel) {
+        composerFocused = false
+        withAnimation(.easeInOut(duration: 0.2)) {
+            composerPanel = composerPanel == panel ? nil : panel
+        }
+    }
+
+    private func closeComposerPanel() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            composerPanel = nil
         }
     }
 
@@ -1383,6 +1412,216 @@ private struct ImagePreviewView: View {
         lastScale = 1
         offset = .zero
         lastOffset = .zero
+    }
+}
+
+private struct AccessoryPanelHeader: View {
+    let title: String
+    let trailingSystemImage: String?
+    let trailingAction: (() -> Void)?
+    let onClose: () -> Void
+
+    var body: some View {
+        ZStack {
+            Capsule()
+                .fill(Color.secondary.opacity(0.35))
+                .frame(width: 36, height: 5)
+
+            HStack {
+                Text(title)
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let trailingSystemImage, let trailingAction {
+                    Button(action: trailingAction) {
+                        Image(systemName: trailingSystemImage)
+                            .font(.system(size: 16, weight: .semibold))
+                            .frame(width: 30, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Button(action: onClose) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(width: 30, height: 28)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("收起面板")
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 12)
+                .onEnded { value in
+                    if value.translation.height > 35 {
+                        onClose()
+                    }
+                }
+        )
+    }
+}
+
+private struct EmojiAccessoryPanel: View {
+    @Binding var text: String
+    let onClose: () -> Void
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 5), count: 8)
+    private let emojis = [
+        "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣",
+        "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰",
+        "😘", "😗", "😙", "😚", "😋", "😛", "😝", "😜",
+        "🤪", "🤨", "🧐", "🤓", "😎", "🤩", "🥳", "😏",
+        "😒", "😞", "😔", "😟", "😕", "🙁", "☹️", "😣",
+        "😖", "😫", "😩", "🥺", "😢", "😭", "😤", "😠",
+        "😡", "🤬", "🤯", "😳", "🥵", "🥶", "😱", "😨",
+        "😰", "😥", "😓", "🤗", "🤔", "🫡", "🤭", "🤫",
+        "🤥", "😶", "😐", "😑", "😬", "🙄", "😯", "😦",
+        "😧", "😮", "😲", "🥱", "😴", "🤤", "😪", "😵",
+        "👍", "👎", "👌", "✌️", "🤞", "🤟", "🤘", "🤙",
+        "👏", "🙌", "🫶", "🙏", "💪", "👋", "🤝", "💯",
+        "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍",
+        "🔥", "✨", "🎉", "🎁", "🌟", "⭐️", "💫", "💬"
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            AccessoryPanelHeader(
+                title: "表情",
+                trailingSystemImage: "delete.left",
+                trailingAction: {
+                    if !text.isEmpty { text.removeLast() }
+                },
+                onClose: onClose
+            )
+
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVGrid(columns: columns, spacing: 6) {
+                    ForEach(Array(emojis.enumerated()), id: \.offset) { item in
+                        Button {
+                            text.append(item.element)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Text(item.element)
+                                .font(.system(size: 27))
+                                .frame(maxWidth: .infinity, minHeight: 36)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(item.element)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 12)
+            }
+        }
+        .background(Color(uiColor: .secondarySystemBackground))
+    }
+}
+
+private struct ToolsAccessoryPanel: View {
+    @EnvironmentObject private var appState: AppState
+    let cameraAvailable: Bool
+    let onCamera: () -> Void
+    let onPhotos: () -> Void
+    let onFile: () -> Void
+    let onQuickReply: (String) -> Void
+    let onClose: () -> Void
+
+    @State private var replies: [CannedReply] = []
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            AccessoryPanelHeader(
+                title: "更多",
+                trailingSystemImage: nil,
+                trailingAction: nil,
+                onClose: onClose
+            )
+
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 12) {
+                        AccessoryToolButton(title: "拍照", systemImage: "camera.fill", action: onCamera)
+                            .disabled(!cameraAvailable)
+                            .opacity(cameraAvailable ? 1 : 0.4)
+                        AccessoryToolButton(title: "相册", systemImage: "photo.fill", action: onPhotos)
+                        AccessoryToolButton(title: "文件", systemImage: "doc.fill", action: onFile)
+                    }
+
+                    Divider()
+
+                    Text("常用语")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+
+                    if replies.isEmpty {
+                        Text(errorMessage ?? "暂无常用语")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 48, alignment: .center)
+                    } else {
+                        LazyVStack(spacing: 7) {
+                            ForEach(replies) { reply in
+                                Button {
+                                    onQuickReply(reply.content)
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(reply.title)
+                                            .font(.subheadline.bold())
+                                            .foregroundStyle(.primary)
+                                        Text(reply.content)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+                                    .background(Color(uiColor: .tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 14)
+            }
+        }
+        .background(Color(uiColor: .secondarySystemBackground))
+        .task {
+            do {
+                replies = try await appState.client?.cannedReplies() ?? []
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct AccessoryToolButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 22, weight: .medium))
+                    .frame(height: 28)
+                Text(title)
+                    .font(.caption)
+            }
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 9)
+            .background(Color(uiColor: .tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
     }
 }
 
