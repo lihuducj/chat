@@ -477,6 +477,7 @@ private struct ChatView: View {
     @State private var showCamera = false
     @State private var showFileImporter = false
     @State private var showQuickReplies = false
+    @State private var showEmojiPicker = false
     @State private var showDetails = false
     @State private var visitorIsTyping = false
     @State private var pendingRecall: ChatMessage?
@@ -508,7 +509,7 @@ private struct ChatView: View {
                                 MessageBubble(
                                     message: message,
                                     client: appState.client,
-                                    receipt: receiptText(for: message),
+                                    receipt: receiptState(for: message),
                                     autoTranslate: appState.autoTranslateEnabled && !message.isAgent,
                                     onImageTap: { previewImageURL = $0 },
                                     onQuote: {
@@ -543,18 +544,6 @@ private struct ChatView: View {
                     .foregroundStyle(.red)
                     .padding(.horizontal)
                     .padding(.top, 5)
-            }
-
-            if visitorIsTyping {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text("对方正在输入…")
-                    Spacer()
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.top, 5)
             }
 
             if let quotedText {
@@ -601,6 +590,12 @@ private struct ChatView: View {
                     Image(systemName: "text.bubble")
                         .font(.system(size: 22))
                 }
+
+                Button { showEmojiPicker = true } label: {
+                    Image(systemName: "face.smiling")
+                        .font(.system(size: 21))
+                }
+                .accessibilityLabel("表情")
 
                 TextField("输入消息", text: $draft, axis: .vertical)
                     .focused($composerFocused)
@@ -652,16 +647,31 @@ private struct ChatView: View {
             ToolbarItem(placement: .principal) {
                 if let email = liveConversation.visitorEmail, !email.isEmpty {
                     Button { copyEmail(email) } label: {
-                        HStack(spacing: 5) {
-                            Text(email).lineLimit(1)
-                            Image(systemName: "doc.on.doc").font(.caption2)
+                        VStack(spacing: 1) {
+                            HStack(spacing: 5) {
+                                Text(email).lineLimit(1)
+                                Image(systemName: "doc.on.doc").font(.caption2)
+                            }
+                            .font(.headline)
+                            if visitorIsTyping {
+                                Text("对方正在输入…")
+                                    .font(.caption2)
+                                    .foregroundStyle(.blue)
+                                    .transition(.opacity)
+                            }
                         }
-                        .font(.headline)
                     }
                     .buttonStyle(.plain)
                     .accessibilityHint("点按复制邮箱")
                 } else {
-                    Text(liveConversation.displayName).font(.headline).lineLimit(1)
+                    VStack(spacing: 1) {
+                        Text(liveConversation.displayName).font(.headline).lineLimit(1)
+                        if visitorIsTyping {
+                            Text("对方正在输入…")
+                                .font(.caption2)
+                                .foregroundStyle(.blue)
+                        }
+                    }
                 }
             }
             ToolbarItemGroup(placement: .navigationBarTrailing) {
@@ -680,6 +690,13 @@ private struct ChatView: View {
                 showQuickReplies = false
                 DispatchQueue.main.async { composerFocused = true }
             }
+        }
+        .sheet(isPresented: $showEmojiPicker, onDismiss: {
+            DispatchQueue.main.async { composerFocused = true }
+        }) {
+            EmojiPickerView(text: $draft)
+                .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showDetails) {
             ConversationDetailsView(conversation: liveConversation)
@@ -996,12 +1013,12 @@ private struct ChatView: View {
         }
     }
 
-    private func receiptText(for message: ChatMessage) -> String? {
+    private func receiptState(for message: ChatMessage) -> MessageReceipt? {
         guard message.isAgent, message.id == messages.last(where: { $0.isAgent })?.id else { return nil }
-        if message.isPending { return "发送中" }
-        if (liveConversation.visitorReadAt ?? 0) >= message.createdAt { return "已读" }
-        if (liveConversation.visitorDeliveredAt ?? 0) >= message.createdAt { return "已送达" }
-        return "已发送"
+        if message.isPending { return .sending }
+        if (liveConversation.visitorReadAt ?? 0) >= message.createdAt { return .read }
+        if (liveConversation.visitorDeliveredAt ?? 0) >= message.createdAt { return .delivered }
+        return .sent
     }
 
     private var draftStorageKey: String {
@@ -1050,10 +1067,37 @@ private struct NativeCameraPicker: UIViewControllerRepresentable {
     }
 }
 
+private enum MessageReceipt: Equatable {
+    case sending
+    case sent
+    case delivered
+    case read
+
+    var symbol: String {
+        switch self {
+        case .sending: return "◷"
+        case .sent: return "✓"
+        case .delivered, .read: return "✓✓"
+        }
+    }
+
+    var accessibilityText: String {
+        switch self {
+        case .sending: return "发送中"
+        case .sent: return "已发送"
+        case .delivered: return "已送达"
+        case .read: return "已读"
+        }
+    }
+
+    var isRead: Bool { self == .read }
+    var isDoubleCheck: Bool { self == .delivered || self == .read }
+}
+
 private struct MessageBubble: View {
     let message: ChatMessage
     let client: APIClient?
-    let receipt: String?
+    let receipt: MessageReceipt?
     let autoTranslate: Bool
     let onImageTap: (URL) -> Void
     let onQuote: () -> Void
@@ -1120,7 +1164,11 @@ private struct MessageBubble: View {
                 HStack(spacing: 4) {
                     Text(DisplayFormatters.time.string(from: DisplayFormatters.date(milliseconds: message.createdAt)))
                     if let receipt {
-                        Text("· \(receipt)")
+                        Text(receipt.symbol)
+                            .fontWeight(.bold)
+                            .tracking(receipt.isDoubleCheck ? -3 : 0)
+                            .foregroundStyle(receipt.isRead ? Color.blue : Color.secondary)
+                            .accessibilityLabel(receipt.accessibilityText)
                     }
                 }
                 .font(.caption2)
@@ -1254,6 +1302,8 @@ private struct ImagePreviewView: View {
     let url: URL
     @State private var scale: CGFloat = 1
     @State private var lastScale: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
 
     var body: some View {
         NavigationStack {
@@ -1266,17 +1316,39 @@ private struct ImagePreviewView: View {
                             .resizable()
                             .scaledToFit()
                             .scaleEffect(scale)
+                            .offset(offset)
                             .gesture(
-                                MagnificationGesture()
-                                    .onChanged { value in
-                                        scale = min(max(lastScale * value, 1), 5)
-                                    }
-                                    .onEnded { _ in lastScale = scale }
+                                SimultaneousGesture(
+                                    MagnificationGesture()
+                                        .onChanged { value in
+                                            scale = min(max(lastScale * value, 1), 5)
+                                        }
+                                        .onEnded { _ in
+                                            lastScale = scale
+                                            if scale <= 1 { resetImage() }
+                                        },
+                                    DragGesture(minimumDistance: 8)
+                                        .onChanged { value in
+                                            guard scale > 1 else { return }
+                                            offset = CGSize(
+                                                width: lastOffset.width + value.translation.width,
+                                                height: lastOffset.height + value.translation.height
+                                            )
+                                        }
+                                        .onEnded { _ in
+                                            if scale > 1 { lastOffset = offset }
+                                            else { resetImage() }
+                                        }
+                                )
                             )
                             .onTapGesture(count: 2) {
                                 withAnimation(.spring(response: 0.3)) {
-                                    scale = scale > 1 ? 1 : 2
-                                    lastScale = scale
+                                    if scale > 1 {
+                                        resetImage()
+                                    } else {
+                                        scale = 2
+                                        lastScale = 2
+                                    }
                                 }
                             }
                     case .failure:
@@ -1288,6 +1360,14 @@ private struct ImagePreviewView: View {
                 }
             }
             .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    if scale > 1 || offset != .zero {
+                        Button("复位") {
+                            withAnimation(.spring(response: 0.3)) { resetImage() }
+                        }
+                        .foregroundStyle(.white)
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }
                         .foregroundStyle(.white)
@@ -1295,6 +1375,76 @@ private struct ImagePreviewView: View {
             }
             .toolbarBackground(.black, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
+        }
+    }
+
+    private func resetImage() {
+        scale = 1
+        lastScale = 1
+        offset = .zero
+        lastOffset = .zero
+    }
+}
+
+private struct EmojiPickerView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var text: String
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 8)
+    private let emojis = [
+        "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣",
+        "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰",
+        "😘", "😗", "😙", "😚", "😋", "😛", "😝", "😜",
+        "🤪", "🤨", "🧐", "🤓", "😎", "🥳", "🤩", "😏",
+        "😒", "😞", "😔", "😟", "😕", "🙁", "☹️", "😣",
+        "😖", "😫", "😩", "🥺", "😢", "😭", "😤", "😠",
+        "😡", "🤬", "🤯", "😳", "🥵", "🥶", "😱", "😨",
+        "😰", "😥", "😓", "🤗", "🤔", "🫡", "🤭", "🤫",
+        "🤥", "😶", "😐", "😑", "😬", "🙄", "😯", "😦",
+        "😧", "😮", "😲", "🥱", "😴", "🤤", "😪", "😵",
+        "👍", "👎", "👌", "✌️", "🤞", "🤟", "🤘", "🤙",
+        "👏", "🙌", "🫶", "🙏", "💪", "👋", "🤝", "💯",
+        "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍",
+        "💔", "❣️", "💕", "💞", "💓", "💗", "💖", "💘",
+        "🔥", "✨", "🎉", "🎊", "🎁", "⭐️", "🌟", "💡",
+        "✅", "❌", "⚠️", "❓", "❗️", "📌", "📎", "📷"
+    ]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 9) {
+                    ForEach(emojis, id: \.self) { emoji in
+                        Button {
+                            text.append(emoji)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Text(emoji)
+                                .font(.system(size: 28))
+                                .frame(maxWidth: .infinity, minHeight: 38)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(emoji)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 16)
+            }
+            .navigationTitle("表情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        if !text.isEmpty { text.removeLast() }
+                    } label: {
+                        Image(systemName: "delete.left")
+                    }
+                    .accessibilityLabel("删除一个字符")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
         }
     }
 }
