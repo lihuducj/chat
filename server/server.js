@@ -717,7 +717,9 @@ async function pushToBark(title, body, conversationId, attempt = 1) {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'bark_url'").get();
   if (!row || !row.value) return;
   const base = row.value.replace(/\/$/, '');
-  let url = `${base}/${encodeURIComponent(title)}/${encodeURIComponent(body)}?group=myservice`;
+  const unreadRow = db.prepare('SELECT COALESCE(SUM(unread_count), 0) AS total FROM conversations').get();
+  const badgeCount = Math.max(1, Math.min(Number(unreadRow?.total) || 1, 999));
+  let url = `${base}/${encodeURIComponent(title)}/${encodeURIComponent(body)}?group=myservice&badge=${badgeCount}&level=timeSensitive`;
   if (conversationId) {
     // Bark 的 url 参数支持自定义 URL Scheme。点击通知后直接唤起原生客服台，
     // conversation 路径会由 App 解析并导航到对应会话，无需先经过 Safari。

@@ -3,6 +3,7 @@ import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
 import Combine
+import UserNotifications
 #if canImport(Translation)
 import Translation
 #endif
@@ -358,6 +359,9 @@ private struct ConversationListView: View {
             let result = try await client.conversations(search: query)
             guard sequence == loadSequence else { return }
             conversations = result
+            if query.isEmpty {
+                syncAppBadge(result.reduce(0) { $0 + $1.unreadCount })
+            }
             errorMessage = nil
         } catch {
             guard sequence == loadSequence else { return }
@@ -365,6 +369,26 @@ private struct ConversationListView: View {
             errorMessage = error.localizedDescription
         }
         isLoading = false
+    }
+
+    private func syncAppBadge(_ unreadCount: Int) {
+        let center = UNUserNotificationCenter.current()
+        let applyBadge = {
+            center.setBadgeCount(max(0, unreadCount)) { _ in }
+        }
+
+        center.getNotificationSettings { settings in
+            switch settings.authorizationStatus {
+            case .notDetermined:
+                center.requestAuthorization(options: [.badge]) { granted, _ in
+                    if granted { applyBadge() }
+                }
+            case .authorized, .provisional, .ephemeral:
+                if settings.badgeSetting == .enabled { applyBadge() }
+            default:
+                break
+            }
+        }
     }
 
     private func delete(_ conversation: Conversation) {
@@ -572,10 +596,11 @@ private struct ChatView: View {
                 .background(Color(uiColor: .secondarySystemBackground))
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 5) {
                 Button { toggleComposerPanel(.tools) } label: {
                     Image(systemName: composerPanel == .tools ? "xmark.circle.fill" : "plus.circle.fill")
-                        .font(.system(size: 25))
+                        .font(.system(size: 21))
+                        .frame(width: 24, height: 30)
                 }
                 .accessibilityLabel(composerPanel == .tools ? "收起功能面板" : "更多功能")
 
@@ -598,8 +623,8 @@ private struct ChatView: View {
 
                 Button { toggleComposerPanel(.emoji) } label: {
                     Image(systemName: composerPanel == .emoji ? "keyboard" : "face.smiling")
-                        .font(.system(size: 22))
-                        .frame(width: 28, height: 34)
+                        .font(.system(size: 19))
+                        .frame(width: 24, height: 30)
                 }
                 .accessibilityLabel(composerPanel == .emoji ? "收起表情面板" : "表情")
 
@@ -609,13 +634,14 @@ private struct ChatView: View {
                 } else {
                     Button(action: sendText) {
                         Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 30))
+                            .font(.system(size: 27))
+                            .frame(width: 28, height: 30)
                     }
                     .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
             .background(.bar)
 
             if let composerPanel {
