@@ -334,7 +334,7 @@ async function openConversation(c) {
   const res = await apiFetch('/api/conversations/' + c.id + '/messages');
   const msgs = await res.json();
   chatMessages.innerHTML = '';
-  msgs.forEach(appendMessage);
+  msgs.forEach((message) => appendMessage(message));
   updateLastMessageReceipt(c);
   await waitForImages(chatMessages);
   scrollToBottom();
@@ -365,6 +365,10 @@ function scrollToBottom() {
       chatMessages.scrollTop = chatMessages.scrollHeight;
     });
   });
+}
+
+function isChatNearBottom(threshold = 80) {
+  return chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight <= threshold;
 }
 
 // ---------- 键盘弹出时主动把输入框顶到键盘上方，并重新滚动到底部 ----------
@@ -928,7 +932,8 @@ imageLightboxImg.addEventListener('wheel', (e) => {
   });
 })();
 
-function appendMessage(m) {
+function appendMessage(m, options) {
+  const stickToBottom = Boolean(options && options.stickToBottom);
   const row = document.createElement('div');
   row.className = 'msg-row' + (m.sender === 'agent' ? ' agent' : '');
   row.dataset.createdAt = m.created_at || 0;
@@ -942,7 +947,9 @@ function appendMessage(m) {
     const img = document.createElement('img');
     img.src = SERVER + m.content;
     img.onclick = () => openImageLightbox(SERVER + m.content);
-    img.addEventListener('load', () => { chatMessages.scrollTop = chatMessages.scrollHeight; }, { once: true });
+    if (stickToBottom) {
+      img.addEventListener('load', scrollToBottom, { once: true });
+    }
     bubble.appendChild(img);
   } else if (m.type === 'file') {
     const a = document.createElement('a');
@@ -1012,7 +1019,7 @@ function appendMessage(m) {
   col.appendChild(timeEl);
   row.appendChild(col);
   chatMessages.appendChild(row);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  if (stickToBottom) scrollToBottom();
 }
 
 // ---------- 引用回复 ----------
@@ -1187,7 +1194,6 @@ if ('serviceWorker' in navigator) {
       const target = conversations.find((c) => c.id === event.data.conversationId);
       if (target) {
         await openConversation(target);
-        [300, 800, 1500].forEach((delay) => setTimeout(scrollToBottom, delay));
       }
     }
   });
@@ -1372,8 +1378,9 @@ function startSocket() {
 
   socket.on('new_message', (m) => {
     if (m.conversation_id === activeConvId) {
-      appendMessage(m);
-      adjustForKeyboard(); // 这里只是单条实时消息，不是批量渲染，调一次没有性能问题
+      const shouldStickToBottom = m.sender === 'agent' || isChatNearBottom();
+      appendMessage(m, { stickToBottom: shouldStickToBottom });
+      if (shouldStickToBottom) adjustForKeyboard();
       markRead(activeConvId);
     } else if (m.sender === 'visitor') {
       flashTitle();
@@ -1457,10 +1464,6 @@ checkAuth().then(async () => {
     const target = conversations.find((c) => c.id === convId);
     if (target) {
       await openConversation(target);
-      // 从推送通知冷启动进来的场景，页面布局比"App已经在跑、点一下列表进入"更不稳定
-      // （安全区计算、视口尺寸这些可能还没完全稳定下来），多补几次延迟校正，
-      // 避免刚打开时消息停在半截、看不到最后（包括自己之前发的）消息
-      [300, 800, 1500].forEach((delay) => setTimeout(scrollToBottom, delay));
     }
     history.replaceState({}, '', location.pathname); // 打开后清掉url参数，避免刷新重复跳转
   }

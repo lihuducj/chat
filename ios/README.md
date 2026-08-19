@@ -113,4 +113,4 @@ chat.example.com
 
 此版本不包含 APNs entitlement。App 在前台时通过 SSE 立即收消息；切到后台、锁屏或被系统清理后由 Bark 提醒。必须在 App 设置中保存 Bark 地址，否则后台没有系统通知。服务器发送 Bark 通知时会附带当前未读总数角标，并使用时效性通知；需要在 iPhone“设置 → 通知 → Bark”中开启锁定屏幕、横幅、声音、标记和时效性通知。
 
-PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。当前版本号为 1.3.0（build 8）。
+PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。当前版本号为 1.3.0（build 9）。

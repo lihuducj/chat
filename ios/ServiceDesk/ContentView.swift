@@ -516,7 +516,10 @@ private struct ChatView: View {
     @State private var typingTask: Task<Void, Never>?
     @State private var typingHideTask: Task<Void, Never>?
     @State private var messageLoadSequence = 0
+    @State private var isReviewingMessageHistory = false
     @FocusState private var composerFocused: Bool
+
+    private let chatBottomID = "chat-bottom-anchor"
 
     init(conversation: Conversation) {
         self.conversation = conversation
@@ -540,6 +543,9 @@ private struct ChatView: View {
                                     receipt: receiptState(for: message),
                                     autoTranslate: appState.autoTranslateEnabled && !message.isAgent,
                                     onImageTap: { previewImageURL = $0 },
+                                    onImageLoaded: {
+                                        keepChatAtBottom(using: proxy)
+                                    },
                                     onQuote: {
                                         quotedText = message.content
                                         composerFocused = true
@@ -551,17 +557,32 @@ private struct ChatView: View {
                                 )
                                 .id(message.id)
                             }
+
+                            Color.clear
+                                .frame(height: 1)
+                                .id(chatBottomID)
+                                .onAppear {
+                                    isReviewingMessageHistory = false
+                                }
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 14)
                     }
                     .background(Color(uiColor: .systemGroupedBackground))
-                    .onChange(of: messages.count) { _ in
-                        guard let last = messages.last else { return }
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 8)
+                            .onChanged { value in
+                                if value.translation.height > 8 {
+                                    isReviewingMessageHistory = true
+                                }
+                            }
+                    )
+                    .onChange(of: messages.last?.id) { _ in
+                        keepChatAtBottom(using: proxy, animated: true)
                     }
                     .onAppear {
-                        if let last = messages.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                        isReviewingMessageHistory = false
+                        keepChatAtBottom(using: proxy)
                     }
                 }
             }
@@ -826,6 +847,28 @@ private struct ChatView: View {
         }
     }
 
+    private func keepChatAtBottom(using proxy: ScrollViewProxy, animated: Bool = false) {
+        guard !isReviewingMessageHistory else { return }
+
+        DispatchQueue.main.async {
+            guard !isReviewingMessageHistory else { return }
+            if animated {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(chatBottomID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(chatBottomID, anchor: .bottom)
+            }
+
+            // 长文本换行和 AsyncImage 成功态都可能比第一轮布局晚一帧完成。
+            // 第二次只做紧邻的布局校准，不使用定时轮询，也不会在用户查看历史时抢滚动位置。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                guard !isReviewingMessageHistory else { return }
+                proxy.scrollTo(chatBottomID, anchor: .bottom)
+            }
+        }
+    }
+
     private func loadMessages(showError: Bool = true) async {
         guard let client = appState.client else { return }
         messageLoadSequence += 1
@@ -865,6 +908,7 @@ private struct ChatView: View {
         )
         draft = ""
         quotedText = nil
+        isReviewingMessageHistory = false
         messages.append(pending)
         isSending = true
         Task {
@@ -964,6 +1008,7 @@ private struct ChatView: View {
             fileSize: upload.size
         )
         if !messages.contains(where: { $0.id == message.id }) {
+            isReviewingMessageHistory = false
             messages.append(message)
         }
         messages.sort { $0.createdAt < $1.createdAt }
@@ -1155,6 +1200,7 @@ private struct MessageBubble: View {
     let receipt: MessageReceipt?
     let autoTranslate: Bool
     let onImageTap: (URL) -> Void
+    let onImageLoaded: () -> Void
     let onQuote: () -> Void
     let onSelectText: () -> Void
     let onRecall: () -> Void
@@ -1173,7 +1219,14 @@ private struct MessageBubble: View {
                             AsyncImage(url: url) { phase in
                                 switch phase {
                                 case let .success(image):
-                                    image.resizable().scaledToFit()
+                                    image
+                                        .resizable()
+                                        .scaledToFit()
+                                        .onAppear {
+                                            DispatchQueue.main.async {
+                                                onImageLoaded()
+                                            }
+                                        }
                                 case .failure:
                                     Label("图片加载失败", systemImage: "photo")
                                 default:
