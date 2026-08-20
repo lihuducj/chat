@@ -1919,18 +1919,42 @@ private struct ImageTextTranslationView: View {
     let sourceText: String
     @State private var translatedText = ""
     @State private var errorMessage: String?
+    @State private var isTranslating = true
     @State private var configuration: TranslationSession.Configuration?
+
+    init(sourceText: String) {
+        self.sourceText = sourceText
+        // Create the configuration once, before the sheet appears. Mutating it from an
+        // on-appear task can recreate the translation task during the sheet transition.
+        _configuration = State(initialValue: TranslationSession.Configuration(
+            source: nil,
+            target: Locale.Language(identifier: "zh-Hans")
+        ))
+    }
 
     var body: some View {
         NavigationStack {
             Group {
                 if let errorMessage {
-                    ContentUnavailableView(
-                        "翻译失败",
-                        systemImage: "exclamationmark.triangle",
-                        description: Text(errorMessage)
-                    )
-                } else if translatedText.isEmpty {
+                    VStack(spacing: 14) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.largeTitle)
+                            .foregroundStyle(.orange)
+                        Text("翻译失败").font(.headline)
+                        Text(errorMessage)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Button("重新翻译") {
+                            self.errorMessage = nil
+                            translatedText = ""
+                            isTranslating = true
+                            configuration?.invalidate()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .padding()
+                } else if isTranslating {
                     VStack(spacing: 12) {
                         ProgressView()
                         Text("正在把图片中的全部文字翻译成中文…")
@@ -1965,23 +1989,66 @@ private struct ImageTextTranslationView: View {
                     .disabled(translatedText.isEmpty)
                 }
             }
-            .task {
-                configuration = TranslationSession.Configuration(
-                    source: nil,
-                    target: Locale.Language(identifier: "zh-Hans")
-                )
-            }
             .translationTask(configuration) { session in
                 do {
-                    let response = try await session.translate(sourceText)
-                    translatedText = response.targetText
+                    let chunks = Self.translationChunks(sourceText)
+                    guard !chunks.isEmpty else {
+                        throw ImageTranslationError.noText
+                    }
+                    var results: [String] = []
+                    results.reserveCapacity(chunks.count)
+                    for chunk in chunks {
+                        try Task.checkCancellation()
+                        let response = try await session.translate(chunk)
+                        results.append(response.targetText)
+                    }
+                    translatedText = results.joined(separator: "\n")
                     errorMessage = nil
+                    isTranslating = false
+                } catch is CancellationError {
+                    return
                 } catch {
                     translatedText = ""
-                    errorMessage = "请确认网络正常，并允许系统下载所需语言包后重试。"
+                    isTranslating = false
+                    errorMessage = "请确认网络正常，并在系统提示时允许下载翻译语言包。"
                 }
             }
         }
+    }
+
+    /// Keep each request small enough for the system translation service while preserving
+    /// every recognized character and its original order.
+    private static func translationChunks(_ text: String, limit: Int = 1_200) -> [String] {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return [] }
+        var chunks: [String] = []
+        var start = cleaned.startIndex
+
+        while start < cleaned.endIndex {
+            let tentativeEnd = cleaned.index(
+                start,
+                offsetBy: limit,
+                limitedBy: cleaned.endIndex
+            ) ?? cleaned.endIndex
+            var end = tentativeEnd
+            if tentativeEnd < cleaned.endIndex,
+               let newline = cleaned[start..<tentativeEnd].lastIndex(of: "\n"),
+               newline > start {
+                end = newline
+            }
+            let chunk = cleaned[start..<end].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !chunk.isEmpty { chunks.append(chunk) }
+            start = end
+            while start < cleaned.endIndex,
+                  cleaned[start].isWhitespace {
+                start = cleaned.index(after: start)
+            }
+        }
+        return chunks
+    }
+
+    private enum ImageTranslationError: Error {
+        case noText
     }
 }
 #endif
