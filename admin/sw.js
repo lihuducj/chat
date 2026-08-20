@@ -1,5 +1,10 @@
-const CACHE = 'myservice-admin-v4';
-const SHELL = ['./index.html', './style.css', './app.js', './manifest.json'];
+const CACHE = 'myservice-admin-v5';
+const SHELL = [
+  './index.html',
+  './style.css?v=20260820-1',
+  './app.js?v=20260820-1',
+  './manifest.json'
+];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)));

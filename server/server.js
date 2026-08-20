@@ -284,7 +284,16 @@ app.get(`/${ADMIN_PATH}/manifest.json`, (req, res) => {
   });
 });
 
-app.use('/' + ADMIN_PATH, express.static(path.join(__dirname, '..', 'admin')));
+app.use('/' + ADMIN_PATH, express.static(path.join(__dirname, '..', 'admin'), {
+  etag: true,
+  maxAge: 0,
+  setHeaders(res, filePath) {
+    // 管理端经常整目录覆盖升级；强制浏览器/CDN每次校验，避免新旧HTML、JS混用后只剩空壳。
+    if (/\.(?:html|js|css|json)$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    }
+  }
+}));
 
 // ---------- 文件上传 ----------
 const ALLOWED_EXTENSIONS = new Set([

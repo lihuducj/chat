@@ -171,7 +171,13 @@ async function loadConversations() {
   const path = '/api/conversations' + (searchQuery ? '?q=' + encodeURIComponent(searchQuery) : '');
   const res = await apiFetch(path);
   if (res.status === 401) { clearToken(); location.replace('login.html'); return; }
+  if (!res.ok) throw new Error('会话接口返回 HTTP ' + res.status);
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    throw new Error('会话接口没有返回 JSON，请检查服务器是否完整上传并已重启');
+  }
   const data = await res.json();
+  if (!Array.isArray(data)) throw new Error('会话接口数据格式不正确');
   if (seq !== loadConversationsSeq) return; // 这次请求发出去之后，又有更新的请求触发了，这个结果已经过期，不能用
   conversations = data;
   renderConvList();
@@ -1185,7 +1191,9 @@ function fmtTime(ts) {
 
 // ---------- PWA ----------
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js', { scope: './' }).catch(() => {});
+  navigator.serviceWorker.register('sw.js?v=5', { scope: './', updateViaCache: 'none' })
+    .then((registration) => registration.update())
+    .catch(() => {});
   // App已经开着的时候点推送通知，Service Worker会用postMessage告诉页面切到指定会话，
   // 不产生任何页面跳转（避免历史记录堆积、避免触发iOS独立App模式那个跳出scope弹简化浏览器的问题）
   navigator.serviceWorker.addEventListener('message', async (event) => {
@@ -1370,6 +1378,8 @@ function startSocket() {
   });
   socket.on('disconnect', () => connDot.classList.remove('online'));
   socket.on('connect_error', (err) => {
+    connDot.classList.remove('online');
+    connDot.title = '实时连接失败：' + ((err && err.message) || '未知错误');
     if (err && err.message === 'unauthorized') {
       clearToken();
       location.replace('login.html');
@@ -1453,6 +1463,28 @@ function startSocket() {
   }, 45000);
 }
 
+function showStartupError(error) {
+  console.error('客服台启动失败：', error);
+  connDot.classList.remove('online');
+  connDot.title = '连接失败';
+  const message = error && error.message ? error.message : '网页资源或接口加载失败';
+  emptyState.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'startup-error';
+  const title = document.createElement('strong');
+  title.textContent = '客服台加载失败';
+  const detail = document.createElement('p');
+  detail.textContent = message;
+  const hint = document.createElement('p');
+  hint.textContent = '请先强制刷新；若仍失败，请重新上传完整的 admin 文件夹和 server.js。';
+  const reload = document.createElement('button');
+  reload.className = 'primary';
+  reload.textContent = '重新加载';
+  reload.onclick = () => location.reload();
+  wrap.append(title, detail, hint, reload);
+  emptyState.appendChild(wrap);
+}
+
 checkAuth().then(async () => {
   startSocket();
   await loadConversations();
@@ -1467,4 +1499,7 @@ checkAuth().then(async () => {
     }
     history.replaceState({}, '', location.pathname); // 打开后清掉url参数，避免刷新重复跳转
   }
+}).catch((error) => {
+  if (error && (error.message === 'no token' || error.message === 'unauthorized')) return;
+  showStartupError(error);
 });
