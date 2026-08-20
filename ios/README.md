@@ -113,4 +113,6 @@ chat.example.com
 
 此版本不包含 APNs entitlement。App 在前台时通过 SSE、App 内提示音和未读数字立即提醒，并主动抑制重复的 Bark；切到后台、锁屏或被系统清理后恢复 Bark 提醒。必须在 App 设置中保存 Bark 地址，否则后台没有系统通知。服务器发送 Bark 通知时会附带当前未读总数角标，并使用时效性通知；需要在 iPhone“设置 → 通知 → Bark”中开启锁定屏幕、横幅、声音、标记和时效性通知。
 
-PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。当前版本号为 1.3.0（build 11）。消息正文可自动识别 `https://example.com`、`www.example.com` 等网址，点击后由 iOS 默认浏览器打开，同时保留长按选择与复制文字。
+PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。当前版本号为 1.3.0（build 12）。消息正文可自动识别 `https://example.com`、`www.example.com` 等网址，点击后由 iOS 默认浏览器打开，同时保留长按选择与复制文字。
+
+build 12 的图片预览接入了 iOS 原生 VisionKit 实况文本：点击“提取文字”后可直接选择并复制图片中的文字，图片仍支持双击缩放、双指缩放和自由拖动。iOS 18 及以上还可以点击“翻译成中文”，把整张图片识别出的内容翻译为简体中文并复制全部结果；iOS 16/17 保留文字提取与系统选择菜单。
