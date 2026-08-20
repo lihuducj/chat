@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 import UIKit
 import Combine
 import UserNotifications
+import ImageIO
 #if canImport(Translation)
 import Translation
 #endif
@@ -321,7 +322,8 @@ private struct ConversationListView: View {
                 guard !Task.isCancelled else { return }
                 await load(showSpinner: conversations.isEmpty)
                 while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 15_000_000_000)
+                    let delay: UInt64 = appState.isRealtimeConnected ? 60_000_000_000 : 8_000_000_000
+                    try? await Task.sleep(nanoseconds: delay)
                     guard !Task.isCancelled else { break }
                     await load(showSpinner: false)
                 }
@@ -827,7 +829,8 @@ private struct ChatView: View {
         .task {
             await loadMessages()
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                let delay: UInt64 = appState.isRealtimeConnected ? 60_000_000_000 : 8_000_000_000
+                try? await Task.sleep(nanoseconds: delay)
                 guard !Task.isCancelled else { break }
                 await loadMessages(showError: false)
             }
@@ -860,7 +863,7 @@ private struct ChatView: View {
                 proxy.scrollTo(chatBottomID, anchor: .bottom)
             }
 
-            // 长文本换行和 AsyncImage 成功态都可能比第一轮布局晚一帧完成。
+            // 长文本换行和图片成功态都可能比第一轮布局晚一帧完成。
             // 第二次只做紧邻的布局校准，不使用定时轮询，也不会在用户查看历史时抢滚动位置。
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                 guard !isReviewingMessageHistory else { return }
@@ -1194,6 +1197,141 @@ private enum MessageReceipt: Equatable {
     var isDoubleCheck: Bool { self == .delivered || self == .read }
 }
 
+@MainActor
+private final class PersistentImageLoader: ObservableObject {
+    @Published private(set) var image: UIImage?
+    @Published private(set) var failed = false
+    @Published private(set) var isLoading = false
+
+    private let url: URL
+    private let maxPixelSize: Int
+
+    private static let cache = URLCache(
+        memoryCapacity: 32 * 1024 * 1024,
+        diskCapacity: 256 * 1024 * 1024,
+        diskPath: "ServiceDeskImageCache"
+    )
+
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = cache
+        configuration.requestCachePolicy = .returnCacheDataElseLoad
+        configuration.waitsForConnectivity = true
+        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.httpShouldUsePipelining = true
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 90
+        return URLSession(configuration: configuration)
+    }()
+
+    init(url: URL, maxPixelSize: Int) {
+        self.url = url
+        self.maxPixelSize = maxPixelSize
+    }
+
+    func load(forceRefresh: Bool = false) async {
+        guard !isLoading else { return }
+        if image != nil, !forceRefresh { return }
+        isLoading = true
+        failed = false
+        defer { isLoading = false }
+
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.cachePolicy = forceRefresh ? .reloadRevalidatingCacheData : .returnCacheDataElseLoad
+        request.setValue("image/*", forHTTPHeaderField: "Accept")
+
+        if !forceRefresh,
+           let cached = Self.cache.cachedResponse(for: request),
+           let decoded = await Self.decode(cached.data, maxPixelSize: maxPixelSize) {
+            image = decoded
+            return
+        }
+
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                let (data, response) = try await Self.session.data(for: request)
+                guard let http = response as? HTTPURLResponse,
+                      (200..<300).contains(http.statusCode),
+                      let decoded = await Self.decode(data, maxPixelSize: maxPixelSize) else {
+                    throw URLError(.cannotDecodeContentData)
+                }
+                Self.cache.storeCachedResponse(CachedURLResponse(response: response, data: data), for: request)
+                image = decoded
+                return
+            } catch {
+                lastError = error
+                if attempt < 2 {
+                    try? await Task.sleep(nanoseconds: UInt64(400 + attempt * 600) * 1_000_000)
+                }
+            }
+        }
+
+        if lastError != nil { failed = true }
+    }
+
+    nonisolated private static func decode(_ data: Data, maxPixelSize: Int) async -> UIImage? {
+        await Task.detached(priority: .userInitiated) {
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+                return UIImage(data: data)
+            }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+                return UIImage(data: data)
+            }
+            return UIImage(cgImage: cgImage)
+        }.value
+    }
+}
+
+private struct CachedMessageImage: View {
+    let onTap: () -> Void
+    let onLoaded: () -> Void
+    @StateObject private var loader: PersistentImageLoader
+    @State private var didNotifyLoaded = false
+
+    init(url: URL, onTap: @escaping () -> Void, onLoaded: @escaping () -> Void) {
+        self.onTap = onTap
+        self.onLoaded = onLoaded
+        _loader = StateObject(wrappedValue: PersistentImageLoader(url: url, maxPixelSize: 960))
+    }
+
+    var body: some View {
+        Group {
+            if let image = loader.image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .onTapGesture(perform: onTap)
+                    .onAppear {
+                        guard !didNotifyLoaded else { return }
+                        didNotifyLoaded = true
+                        DispatchQueue.main.async { onLoaded() }
+                    }
+            } else if loader.failed {
+                Button {
+                    Task { await loader.load(forceRefresh: true) }
+                } label: {
+                    Label("图片加载失败，点按重试", systemImage: "arrow.clockwise")
+                        .font(.caption)
+                        .frame(height: 100)
+                }
+                .buttonStyle(.plain)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 100)
+            }
+        }
+        .task { await loader.load() }
+    }
+}
+
 private struct MessageBubble: View {
     let message: ChatMessage
     let client: APIClient?
@@ -1215,26 +1353,11 @@ private struct MessageBubble: View {
                             .italic()
                             .foregroundStyle(.secondary)
                     } else if message.type == "image", let url = client?.absoluteURL(for: message.content) {
-                        Button { onImageTap(url) } label: {
-                            AsyncImage(url: url) { phase in
-                                switch phase {
-                                case let .success(image):
-                                    image
-                                        .resizable()
-                                        .scaledToFit()
-                                        .onAppear {
-                                            DispatchQueue.main.async {
-                                                onImageLoaded()
-                                            }
-                                        }
-                                case .failure:
-                                    Label("图片加载失败", systemImage: "photo")
-                                default:
-                                    ProgressView().frame(height: 100)
-                                }
-                            }
-                        }
-                        .buttonStyle(.plain)
+                        CachedMessageImage(
+                            url: url,
+                            onTap: { onImageTap(url) },
+                            onLoaded: onImageLoaded
+                        )
                         .frame(maxWidth: 240, maxHeight: 300)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                     } else if message.type == "file", let url = client?.absoluteURL(for: message.content) {
@@ -1251,14 +1374,21 @@ private struct MessageBubble: View {
                     } else {
                         #if canImport(Translation)
                         if #available(iOS 18.0, *), autoTranslate {
-                            AutoTranslatedMessageText(text: message.content)
+                            AutoTranslatedMessageText(
+                                text: message.content,
+                                isAgentMessage: message.isAgent
+                            )
                         } else {
-                            Text(message.content)
-                                .textSelection(.enabled)
+                            LinkifiedSelectableText(
+                                text: message.content,
+                                isAgentMessage: message.isAgent
+                            )
                         }
                         #else
-                        Text(message.content)
-                            .textSelection(.enabled)
+                        LinkifiedSelectableText(
+                            text: message.content,
+                            isAgentMessage: message.isAgent
+                        )
                         #endif
                     }
                 }
@@ -1364,24 +1494,108 @@ private struct SelectableUITextView: UIViewRepresentable {
     }
 }
 
+/// A native, selectable message body that recognizes web links without using a WebView.
+/// UITextView's data detector also recognizes common bare domains such as example.com.
+private struct LinkifiedSelectableText: UIViewRepresentable {
+    let text: String
+    let isAgentMessage: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = false
+        view.dataDetectorTypes = [.link]
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.adjustsFontForContentSizeCategory = true
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
+        view.setContentHuggingPriority(.required, for: .vertical)
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        let textColor: UIColor = isAgentMessage ? .white : .label
+        let linkColor: UIColor = isAgentMessage ? .white : .systemBlue
+        let font = UIFont.preferredFont(forTextStyle: .body)
+
+        if view.text != text {
+            view.text = text
+        }
+        view.font = font
+        view.textColor = textColor
+        view.tintColor = linkColor
+        view.linkTextAttributes = [
+            .foregroundColor: linkColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        view.accessibilityLabel = text
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: UITextView,
+        context: Context
+    ) -> CGSize? {
+        let font = uiView.font ?? UIFont.preferredFont(forTextStyle: .body)
+        let availableWidth = max(1, proposal.width ?? UIScreen.main.bounds.width * 0.72)
+        let bounds = (text as NSString).boundingRect(
+            with: CGSize(width: availableWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font],
+            context: nil
+        )
+        let width = min(availableWidth, max(1, ceil(bounds.width) + 1))
+        let fitted = uiView.sizeThatFits(
+            CGSize(width: width, height: .greatestFiniteMagnitude)
+        )
+        return CGSize(width: width, height: max(1, ceil(fitted.height)))
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        func textView(
+            _ textView: UITextView,
+            shouldInteractWith url: URL,
+            in characterRange: NSRange,
+            interaction: UITextItemInteraction
+        ) -> Bool {
+            guard let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else {
+                return true
+            }
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            return false
+        }
+    }
+}
+
 #if canImport(Translation)
 @available(iOS 18.0, *)
 private struct AutoTranslatedMessageText: View {
     let text: String
+    let isAgentMessage: Bool
     @State private var translatedText: String?
     @State private var configuration: TranslationSession.Configuration?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text(text).textSelection(.enabled)
+            LinkifiedSelectableText(text: text, isAgentMessage: isAgentMessage)
             if let translatedText, translatedText != text {
                 Divider()
                 HStack(alignment: .top, spacing: 5) {
                     Image(systemName: "translate")
                         .font(.caption)
                         .foregroundStyle(.blue)
-                    Text(translatedText)
-                        .textSelection(.enabled)
+                    LinkifiedSelectableText(
+                        text: translatedText,
+                        isAgentMessage: isAgentMessage
+                    )
                 }
             }
         }
@@ -1408,65 +1622,73 @@ private struct AutoTranslatedMessageText: View {
 private struct ImagePreviewView: View {
     @Environment(\.dismiss) private var dismiss
     let url: URL
+    @StateObject private var loader: PersistentImageLoader
     @State private var scale: CGFloat = 1
     @State private var lastScale: CGFloat = 1
     @State private var offset: CGSize = .zero
     @State private var lastOffset: CGSize = .zero
 
+    init(url: URL) {
+        self.url = url
+        _loader = StateObject(wrappedValue: PersistentImageLoader(url: url, maxPixelSize: 3000))
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 Color.black.ignoresSafeArea()
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFit()
-                            .scaleEffect(scale)
-                            .offset(offset)
-                            .gesture(
-                                SimultaneousGesture(
-                                    MagnificationGesture()
-                                        .onChanged { value in
-                                            scale = min(max(lastScale * value, 1), 5)
-                                        }
-                                        .onEnded { _ in
-                                            lastScale = scale
-                                            if scale <= 1 { resetImage() }
-                                        },
-                                    DragGesture(minimumDistance: 8)
-                                        .onChanged { value in
-                                            guard scale > 1 else { return }
-                                            offset = CGSize(
-                                                width: lastOffset.width + value.translation.width,
-                                                height: lastOffset.height + value.translation.height
-                                            )
-                                        }
-                                        .onEnded { _ in
-                                            if scale > 1 { lastOffset = offset }
-                                            else { resetImage() }
-                                        }
-                                )
-                            )
-                            .onTapGesture(count: 2) {
-                                withAnimation(.spring(response: 0.3)) {
-                                    if scale > 1 {
-                                        resetImage()
-                                    } else {
-                                        scale = 2
-                                        lastScale = 2
+                if let uiImage = loader.image {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .scaledToFit()
+                        .scaleEffect(scale)
+                        .offset(offset)
+                        .gesture(
+                            SimultaneousGesture(
+                                MagnificationGesture()
+                                    .onChanged { value in
+                                        scale = min(max(lastScale * value, 1), 5)
                                     }
+                                    .onEnded { _ in
+                                        lastScale = scale
+                                        if scale <= 1 { resetImage() }
+                                    },
+                                DragGesture(minimumDistance: 8)
+                                    .onChanged { value in
+                                        guard scale > 1 else { return }
+                                        offset = CGSize(
+                                            width: lastOffset.width + value.translation.width,
+                                            height: lastOffset.height + value.translation.height
+                                        )
+                                    }
+                                    .onEnded { _ in
+                                        if scale > 1 { lastOffset = offset }
+                                        else { resetImage() }
+                                    }
+                            )
+                        )
+                        .onTapGesture(count: 2) {
+                            withAnimation(.spring(response: 0.3)) {
+                                if scale > 1 {
+                                    resetImage()
+                                } else {
+                                    scale = 2
+                                    lastScale = 2
                                 }
                             }
-                    case .failure:
-                        Label("图片加载失败", systemImage: "exclamationmark.triangle")
+                        }
+                } else if loader.failed {
+                    Button {
+                        Task { await loader.load(forceRefresh: true) }
+                    } label: {
+                        Label("图片加载失败，点按重试", systemImage: "arrow.clockwise")
                             .foregroundStyle(.white)
-                    default:
-                        ProgressView().tint(.white)
                     }
+                } else {
+                    ProgressView().tint(.white)
                 }
             }
+            .task { await loader.load() }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     if scale > 1 || offset != .zero {

@@ -5,6 +5,17 @@ struct APIClient {
     let token: String?
 
     private let decoder = JSONDecoder()
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.httpShouldUsePipelining = true
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 90
+        return URLSession(configuration: configuration)
+    }()
 
     func probe() async throws {
         _ = try await rawRequest(path: "/api/native/health")
@@ -88,6 +99,16 @@ struct APIClient {
         let _: APIStatus = try await request(
             path: "/api/conversations/\(escaped(conversationId))/typing",
             method: "POST"
+        )
+    }
+
+    func reportNativePresence(active: Bool) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["active": active])
+        let _: APIStatus = try await request(
+            path: "/api/native/presence",
+            method: "POST",
+            body: body,
+            timeout: 10
         )
     }
 
@@ -200,7 +221,7 @@ struct APIClient {
                         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                     }
 
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    let (bytes, response) = try await Self.session.bytes(for: request)
                     guard let http = response as? HTTPURLResponse else {
                         throw AppClientError.invalidResponse
                     }
@@ -272,7 +293,7 @@ struct APIClient {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw AppClientError.invalidResponse }
         if http.statusCode == 401 { throw AppClientError.unauthorized }
         guard (200..<300).contains(http.statusCode) else {

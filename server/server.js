@@ -181,6 +181,12 @@ function requireUploadIdentity(req, res, next) {
 // 使用系统自带的 HTTP 长连接，不要求 iOS App 集成第三方 Socket.IO SDK。
 // Nginx 反代时 X-Accel-Buffering=no 可以避免事件被缓存，消息会立即到达手机。
 const nativeEventClients = new Set();
+let nativeForegroundSeenAt = 0;
+const NATIVE_FOREGROUND_TTL_MS = 15 * 1000;
+
+function isNativeAppForeground() {
+  return Date.now() - nativeForegroundSeenAt < NATIVE_FOREGROUND_TTL_MS;
+}
 
 app.get('/api/native/health', (req, res) => {
   res.json({ ok: true, apiVersion: 2, pushMode: 'bark' });
@@ -214,6 +220,11 @@ app.get('/api/native/events', requireAuth, (req, res) => {
     clearInterval(heartbeat);
     nativeEventClients.delete(res);
   });
+});
+
+app.post('/api/native/presence', requireAuth, (req, res) => {
+  nativeForegroundSeenAt = req.body && req.body.active === true ? Date.now() : 0;
+  res.json({ ok: true });
 });
 
 app.post('/api/login', (req, res) => {
@@ -332,7 +343,11 @@ app.use('/uploads', (req, res, next) => {
     res.setHeader('Content-Disposition', 'attachment');
   }
   next();
-}, express.static(UPLOAD_DIR));
+}, express.static(UPLOAD_DIR, {
+  etag: true,
+  immutable: true,
+  maxAge: '365d'
+}));
 
 // ---------- Widget 外观配置（供 widget.js 拉取，无需登录） ----------
 const WIDGET_DEFAULTS = {
@@ -1031,10 +1046,10 @@ io.on('connection', (socket) => {
       io.to('agents').emit('conversation_updated', { conversationId: convId, hasNewVisitorMsg: true });
       emitNativeEvent('new_message', convId, { message: msg });
 
-      // 不管客服当前在不在界面上，都推送——宁可偶尔重复收到通知，也不能因为"在线状态"判断的
-      // 边界情况(比如切到别的App、锁屏但socket还没断开检测到)而漏掉客户消息的提醒
       const preview = clean.type === 'text' ? clean.content.slice(0, 60) : `[${clean.type === 'image' ? '图片' : '文件'}]`;
-      pushToBark('新客服消息', preview, convId);
+      // 原生 App 明确处于前台时由 SSE、App 内声音和未读数字提醒，不再重复发送 Bark。
+      // App 进入后台会立即上报；上报失败时 15 秒心跳过期后自动恢复 Bark，避免长期漏通知。
+      if (!isNativeAppForeground()) pushToBark('新客服消息', preview, convId);
       pushWebPush('新客服消息', preview, convId);
     });
   }

@@ -19,6 +19,8 @@ final class AppState: ObservableObject {
     private let foregroundSoundKey = "nativeForegroundSoundEnabled"
     private let autoTranslateKey = "nativeAutoTranslateEnabled"
     private var eventTask: Task<Void, Never>?
+    private var presenceTask: Task<Void, Never>?
+    private var appIsForeground = false
 
     init() {
         foregroundSoundEnabled = UserDefaults.standard.object(forKey: foregroundSoundKey) as? Bool ?? true
@@ -41,6 +43,7 @@ final class AppState: ObservableObject {
             try await client.checkSession()
             sessionMessage = nil
             startEventStream()
+            restartPresenceReportingIfNeeded()
         } catch {
             if case AppClientError.unauthorized = error {
                 clearToken()
@@ -49,6 +52,7 @@ final class AppState: ObservableObject {
                 // 临时断网不能把有效登录清掉。保留 token，进入会话页后自动重连。
                 sessionMessage = "暂时无法连接服务器，网络恢复后会自动重试"
                 startEventStream()
+                restartPresenceReportingIfNeeded()
             }
         }
     }
@@ -71,10 +75,14 @@ final class AppState: ObservableObject {
         KeychainStore.saveToken(response.token)
         sessionMessage = nil
         startEventStream()
+        restartPresenceReportingIfNeeded()
     }
 
     func logout() async {
-        if let client { try? await client.logout() }
+        if let client {
+            try? await client.reportNativePresence(active: false)
+            try? await client.logout()
+        }
         clearToken()
     }
 
@@ -117,6 +125,38 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: autoTranslateKey)
     }
 
+    func setAppForeground(_ isForeground: Bool) {
+        guard appIsForeground != isForeground else { return }
+        appIsForeground = isForeground
+        presenceTask?.cancel()
+        presenceTask = nil
+
+        guard let client, token != nil else { return }
+        if isForeground {
+            presenceTask = Task {
+                while !Task.isCancelled {
+                    try? await client.reportNativePresence(active: isRealtimeConnected)
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+            }
+        } else {
+            Task { try? await client.reportNativePresence(active: false) }
+        }
+    }
+
+    private func restartPresenceReportingIfNeeded() {
+        guard appIsForeground else { return }
+        presenceTask?.cancel()
+        presenceTask = nil
+        guard let client, token != nil else { return }
+        presenceTask = Task {
+            while !Task.isCancelled {
+                try? await client.reportNativePresence(active: isRealtimeConnected)
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+    }
+
     private func startEventStream() {
         eventTask?.cancel()
         guard let client, token != nil else { return }
@@ -129,9 +169,14 @@ final class AppState: ObservableObject {
                         if event.type == "connected" {
                             isRealtimeConnected = true
                             sessionMessage = nil
+                            if appIsForeground {
+                                try? await client.reportNativePresence(active: true)
+                            }
                         } else {
                             lastEvent = event
-                            if event.type == "new_message", event.message?.sender == "visitor" {
+                            if appIsForeground,
+                               event.type == "new_message",
+                               event.message?.sender == "visitor" {
                                 if foregroundSoundEnabled {
                                     AudioServicesPlaySystemSound(1007)
                                 }
@@ -142,6 +187,9 @@ final class AppState: ObservableObject {
                 } catch {
                     guard let self, !Task.isCancelled else { return }
                     isRealtimeConnected = false
+                    if appIsForeground {
+                        try? await client.reportNativePresence(active: false)
+                    }
                     if case AppClientError.unauthorized = error {
                         clearToken()
                         sessionMessage = error.localizedDescription
@@ -156,6 +204,8 @@ final class AppState: ObservableObject {
     private func clearToken() {
         eventTask?.cancel()
         eventTask = nil
+        presenceTask?.cancel()
+        presenceTask = nil
         isRealtimeConnected = false
         lastEvent = nil
         token = nil
