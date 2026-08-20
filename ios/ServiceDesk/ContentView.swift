@@ -1624,13 +1624,6 @@ private struct ImagePreviewView: View {
     @Environment(\.dismiss) private var dismiss
     let url: URL
     @StateObject private var loader: PersistentImageLoader
-    @State private var isAnalyzingText = false
-    @State private var recognizedText = ""
-    @State private var textAnalysisError: String?
-    @State private var liveTextEnabled = false
-    @State private var showTranslation = false
-    @State private var notice = ""
-    @State private var showNotice = false
 
     init(url: URL) {
         self.url = url
@@ -1642,15 +1635,7 @@ private struct ImagePreviewView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 if let uiImage = loader.image {
-                    LiveTextImageView(
-                        image: uiImage,
-                        liveTextEnabled: liveTextEnabled
-                    ) { analyzing, text, error in
-                        isAnalyzingText = analyzing
-                        if let text { recognizedText = text }
-                        textAnalysisError = error
-                        if error != nil { liveTextEnabled = false }
-                    }
+                    LiveTextImageView(image: uiImage)
                     .ignoresSafeArea(edges: .horizontal)
                 } else if loader.failed {
                     Button {
@@ -1664,9 +1649,6 @@ private struct ImagePreviewView: View {
                 }
             }
             .task { await loader.load() }
-            .safeAreaInset(edge: .bottom) {
-                imageTextToolbar
-            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }
@@ -1675,99 +1657,15 @@ private struct ImagePreviewView: View {
             }
             .toolbarBackground(.black, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-            .alert("提示", isPresented: $showNotice) {
-                Button("知道了", role: .cancel) {}
-            } message: {
-                Text(notice)
-            }
-            .sheet(isPresented: $showTranslation) {
-                #if canImport(Translation)
-                if #available(iOS 18.0, *) {
-                    ImageTextTranslationView(sourceText: recognizedText)
-                }
-                #endif
-            }
         }
-    }
-
-    private var imageTextToolbar: some View {
-        HStack(spacing: 12) {
-            Button {
-                guard ImageAnalyzer.isSupported else {
-                    presentNotice("这台设备不支持图片文字识别。")
-                    return
-                }
-                if let textAnalysisError {
-                    presentNotice(textAnalysisError)
-                    return
-                }
-                if isAnalyzingText {
-                    presentNotice("正在识别图片文字，请稍候。")
-                    return
-                }
-                guard !recognizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    presentNotice("这张图片中没有识别到可选择的文字。")
-                    return
-                }
-                liveTextEnabled.toggle()
-            } label: {
-                Label(
-                    isAnalyzingText ? "识别中" : "提取文字",
-                    systemImage: liveTextEnabled ? "text.viewfinder" : "viewfinder"
-                )
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(liveTextEnabled ? .blue : Color(uiColor: .darkGray))
-
-            Button {
-                translateAllImageText()
-            } label: {
-                Label("翻译成中文", systemImage: "translate")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.blue)
-        }
-        .font(.subheadline.bold())
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(.black.opacity(0.92))
-    }
-
-    private func translateAllImageText() {
-        if isAnalyzingText {
-            presentNotice("正在识别图片文字，请稍候。")
-            return
-        }
-        guard !recognizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            presentNotice(textAnalysisError ?? "这张图片中没有识别到可以翻译的文字。")
-            return
-        }
-        #if canImport(Translation)
-        if #available(iOS 18.0, *) {
-            showTranslation = true
-        } else {
-            presentNotice("整张图片翻译成中文需要 iOS 18 或更高版本；当前系统仍可使用“提取文字”选择并复制。")
-        }
-        #else
-        presentNotice("当前系统不支持原生整图翻译，但仍可提取和复制图片文字。")
-        #endif
-    }
-
-    private func presentNotice(_ message: String) {
-        notice = message
-        showNotice = true
     }
 }
 
 private struct LiveTextImageView: UIViewRepresentable {
     let image: UIImage
-    let liveTextEnabled: Bool
-    let onAnalysisChange: (_ analyzing: Bool, _ text: String?, _ error: String?) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onAnalysisChange: onAnalysisChange)
+        Coordinator()
     }
 
     func makeUIView(context: Context) -> UIScrollView {
@@ -1803,13 +1701,12 @@ private struct LiveTextImageView: UIViewRepresentable {
         doubleTap.numberOfTapsRequired = 2
         imageView.addGestureRecognizer(doubleTap)
         context.coordinator.scrollView = scrollView
-        context.coordinator.set(image: image, liveTextEnabled: liveTextEnabled)
+        context.coordinator.set(image: image)
         return scrollView
     }
 
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
-        context.coordinator.onAnalysisChange = onAnalysisChange
-        context.coordinator.set(image: image, liveTextEnabled: liveTextEnabled)
+        context.coordinator.set(image: image)
     }
 
     static func dismantleUIView(_ uiView: UIScrollView, coordinator: Coordinator) {
@@ -1823,28 +1720,28 @@ private struct LiveTextImageView: UIViewRepresentable {
         let analyzer = ImageAnalyzer()
         weak var scrollView: UIScrollView?
         var analysisTask: Task<Void, Never>?
-        var onAnalysisChange: (_ analyzing: Bool, _ text: String?, _ error: String?) -> Void
 
         private var currentImage: UIImage?
-        private var wantsLiveText = false
 
-        init(onAnalysisChange: @escaping (_ analyzing: Bool, _ text: String?, _ error: String?) -> Void) {
-            self.onAnalysisChange = onAnalysisChange
+        override init() {
             super.init()
-            // This screen focuses on safe text selection/copy. Message-body links are handled separately.
-            interaction.allowLongPressForDataDetectorsInTextMode = false
+            interaction.allowLongPressForDataDetectorsInTextMode = true
+            interaction.isSupplementaryInterfaceHidden = false
+            interaction.supplementaryInterfaceContentInsets = UIEdgeInsets(
+                top: 12,
+                left: 12,
+                bottom: 16,
+                right: 12
+            )
         }
 
-        func set(image: UIImage, liveTextEnabled: Bool) {
-            wantsLiveText = liveTextEnabled
+        func set(image: UIImage) {
             let isNewImage = currentImage !== image
             if isNewImage {
                 currentImage = image
                 imageView.image = image
                 scrollView?.setZoomScale(1, animated: false)
                 analyze(image)
-            } else {
-                updateInteractionMode()
             }
         }
 
@@ -1854,11 +1751,9 @@ private struct LiveTextImageView: UIViewRepresentable {
             interaction.analysis = nil
 
             guard ImageAnalyzer.isSupported else {
-                report(analyzing: false, text: "", error: "这台设备不支持图片文字识别。")
                 return
             }
 
-            report(analyzing: true, text: nil, error: nil)
             analysisTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
@@ -1868,32 +1763,13 @@ private struct LiveTextImageView: UIViewRepresentable {
                           let currentImage,
                           currentImage === image else { return }
                     interaction.analysis = analysis
-                    updateInteractionMode()
-                    report(analyzing: false, text: interaction.text, error: nil)
+                    interaction.preferredInteractionTypes = .automaticTextOnly
+                    interaction.isSupplementaryInterfaceHidden = false
                 } catch is CancellationError {
                     return
                 } catch {
-                    guard !Task.isCancelled else { return }
-                    report(analyzing: false, text: "", error: "图片文字识别失败，请重新打开图片后重试。")
+                    return
                 }
-            }
-        }
-
-        private func updateInteractionMode() {
-            guard interaction.analysis != nil, wantsLiveText else {
-                interaction.preferredInteractionTypes = []
-                interaction.selectableItemsHighlighted = false
-                interaction.resetTextSelection()
-                return
-            }
-            interaction.preferredInteractionTypes = .textSelection
-            interaction.selectableItemsHighlighted = true
-        }
-
-        private func report(analyzing: Bool, text: String?, error: String?) {
-            let callback = onAnalysisChange
-            DispatchQueue.main.async {
-                callback(analyzing, text, error)
             }
         }
 
@@ -1912,146 +1788,6 @@ private struct LiveTextImageView: UIViewRepresentable {
     }
 }
 
-#if canImport(Translation)
-@available(iOS 18.0, *)
-private struct ImageTextTranslationView: View {
-    @Environment(\.dismiss) private var dismiss
-    let sourceText: String
-    @State private var translatedText = ""
-    @State private var errorMessage: String?
-    @State private var isTranslating = true
-    @State private var configuration: TranslationSession.Configuration?
-
-    init(sourceText: String) {
-        self.sourceText = sourceText
-        // Create the configuration once, before the sheet appears. Mutating it from an
-        // on-appear task can recreate the translation task during the sheet transition.
-        _configuration = State(initialValue: TranslationSession.Configuration(
-            source: nil,
-            target: Locale.Language(identifier: "zh-Hans")
-        ))
-    }
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if let errorMessage {
-                    VStack(spacing: 14) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.largeTitle)
-                            .foregroundStyle(.orange)
-                        Text("翻译失败").font(.headline)
-                        Text(errorMessage)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                        Button("重新翻译") {
-                            self.errorMessage = nil
-                            translatedText = ""
-                            isTranslating = true
-                            configuration?.invalidate()
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    .padding()
-                } else if isTranslating {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                        Text("正在把图片中的全部文字翻译成中文…")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        Text("首次使用时，系统可能需要下载语言包。")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                } else {
-                    ScrollView {
-                        Text(translatedText)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                            .padding()
-                    }
-                }
-            }
-            .navigationTitle("图片翻译")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        UIPasteboard.general.string = translatedText
-                        UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    } label: {
-                        Label("复制全部", systemImage: "doc.on.doc")
-                    }
-                    .disabled(translatedText.isEmpty)
-                }
-            }
-            .translationTask(configuration) { session in
-                do {
-                    let chunks = Self.translationChunks(sourceText)
-                    guard !chunks.isEmpty else {
-                        throw ImageTranslationError.noText
-                    }
-                    var results: [String] = []
-                    results.reserveCapacity(chunks.count)
-                    for chunk in chunks {
-                        try Task.checkCancellation()
-                        let response = try await session.translate(chunk)
-                        results.append(response.targetText)
-                    }
-                    translatedText = results.joined(separator: "\n")
-                    errorMessage = nil
-                    isTranslating = false
-                } catch is CancellationError {
-                    return
-                } catch {
-                    translatedText = ""
-                    isTranslating = false
-                    errorMessage = "请确认网络正常，并在系统提示时允许下载翻译语言包。"
-                }
-            }
-        }
-    }
-
-    /// Keep each request small enough for the system translation service while preserving
-    /// every recognized character and its original order.
-    private static func translationChunks(_ text: String, limit: Int = 1_200) -> [String] {
-        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return [] }
-        var chunks: [String] = []
-        var start = cleaned.startIndex
-
-        while start < cleaned.endIndex {
-            let tentativeEnd = cleaned.index(
-                start,
-                offsetBy: limit,
-                limitedBy: cleaned.endIndex
-            ) ?? cleaned.endIndex
-            var end = tentativeEnd
-            if tentativeEnd < cleaned.endIndex,
-               let newline = cleaned[start..<tentativeEnd].lastIndex(of: "\n"),
-               newline > start {
-                end = newline
-            }
-            let chunk = cleaned[start..<end].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !chunk.isEmpty { chunks.append(chunk) }
-            start = end
-            while start < cleaned.endIndex,
-                  cleaned[start].isWhitespace {
-                start = cleaned.index(after: start)
-            }
-        }
-        return chunks
-    }
-
-    private enum ImageTranslationError: Error {
-        case noText
-    }
-}
-#endif
 
 private struct AccessoryPanelHeader: View {
     let title: String
