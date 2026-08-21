@@ -203,8 +203,26 @@ enum DisplayFormatters {
         return formatter
     }()
 
+    private static let chatDay: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy年M月d日 EEEE"
+        return formatter
+    }()
+
     static func date(milliseconds: Int64) -> Date {
         Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1000)
+    }
+
+    static func chatDayLabel(milliseconds: Int64, now: Date = Date()) -> String {
+        let value = date(milliseconds: milliseconds)
+        let calendar = Calendar.autoupdatingCurrent
+        if calendar.isDate(value, inSameDayAs: now) { return "今天" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+           calendar.isDate(value, inSameDayAs: yesterday) {
+            return "昨天"
+        }
+        return chatDay.string(from: value)
     }
 
     static func fileSize(_ bytes: Int64?) -> String {

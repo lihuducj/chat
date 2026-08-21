@@ -539,7 +539,12 @@ private struct ChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 10) {
-                            ForEach(messages) { message in
+                            ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
+                                if shouldShowDateSeparator(at: index) {
+                                    ChatDateSeparator(
+                                        title: DisplayFormatters.chatDayLabel(milliseconds: message.createdAt)
+                                    )
+                                }
                                 MessageBubble(
                                     message: message,
                                     client: appState.client,
@@ -1125,6 +1130,16 @@ private struct ChatView: View {
         return .sent
     }
 
+    private func shouldShowDateSeparator(at index: Int) -> Bool {
+        guard messages.indices.contains(index) else { return false }
+        guard index > 0 else { return true }
+        let calendar = Calendar.autoupdatingCurrent
+        return !calendar.isDate(
+            DisplayFormatters.date(milliseconds: messages[index - 1].createdAt),
+            inSameDayAs: DisplayFormatters.date(milliseconds: messages[index].createdAt)
+        )
+    }
+
     private var draftStorageKey: String {
         "conversation-draft-\(conversation.id)"
     }
@@ -1333,6 +1348,26 @@ private struct CachedMessageImage: View {
     }
 }
 
+private struct ChatDateSeparator: View {
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Rectangle().fill(Color.secondary.opacity(0.18)).frame(height: 1)
+            Text(title)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
+            Rectangle().fill(Color.secondary.opacity(0.18)).frame(height: 1)
+        }
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("聊天日期：\(title)")
+    }
+}
+
 private struct MessageBubble: View {
     let message: ChatMessage
     let client: APIClient?
@@ -1343,6 +1378,12 @@ private struct MessageBubble: View {
     let onQuote: () -> Void
     let onSelectText: () -> Void
     let onRecall: () -> Void
+    @State private var showFullText = false
+
+    private var isLongText: Bool {
+        guard message.type == "text", !message.isRecalled else { return false }
+        return message.content.count > 360 || message.content.components(separatedBy: "\n").count > 8
+    }
 
     var body: some View {
         HStack {
@@ -1372,6 +1413,27 @@ private struct MessageBubble: View {
                                 }
                             }
                         }
+                    } else if isLongText {
+                        Button {
+                            showFullText = true
+                        } label: {
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(message.content)
+                                    .font(.body)
+                                    .multilineTextAlignment(.leading)
+                                    .lineLimit(8)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                HStack(spacing: 4) {
+                                    Spacer()
+                                    Text("查看全文")
+                                    Image(systemName: "chevron.up.chevron.down")
+                                }
+                                .font(.caption.bold())
+                                .foregroundStyle(message.isAgent ? Color.white.opacity(0.88) : Color.blue)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("点按查看完整消息")
                     } else {
                         #if canImport(Translation)
                         if #available(iOS 18.0, *), autoTranslate {
@@ -1433,9 +1495,99 @@ private struct MessageBubble: View {
                     }
                 }
             }
+            .sheet(isPresented: $showFullText) {
+                ExpandedMessageTextView(
+                    message: message,
+                    onQuote: onQuote,
+                    onSelectText: onSelectText,
+                    onRecall: onRecall
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
             .opacity(message.isPending ? 0.65 : 1)
             if !message.isAgent { Spacer(minLength: 48) }
         }
+    }
+}
+
+private struct ExpandedMessageTextView: View {
+    @Environment(\.dismiss) private var dismiss
+    let message: ChatMessage
+    let onQuote: () -> Void
+    let onSelectText: () -> Void
+    let onRecall: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LinkifiedSelectableText(
+                    text: message.content,
+                    isAgentMessage: false
+                )
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contextMenu { messageActions }
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("完整消息")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItemGroup(placement: .confirmationAction) {
+                    Button(action: quoteAndClose) {
+                        Image(systemName: "arrowshape.turn.up.left")
+                    }
+                    .accessibilityLabel("引用回复")
+                    Button {
+                        UIPasteboard.general.string = message.content
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .accessibilityLabel("复制全文")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var messageActions: some View {
+        Button(action: quoteAndClose) {
+            Label("引用回复", systemImage: "arrowshape.turn.up.left")
+        }
+        Button {
+            UIPasteboard.general.string = message.content
+        } label: {
+            Label("复制全文", systemImage: "doc.on.doc")
+        }
+        Button(action: selectAndClose) {
+            Label("选择部分文字", systemImage: "text.cursor")
+        }
+        if message.isAgent && !message.isRecalled {
+            Button(role: .destructive, action: recallAndClose) {
+                Label("撤回消息", systemImage: "arrow.uturn.backward")
+            }
+        }
+    }
+
+    private func quoteAndClose() {
+        dismissThen(onQuote)
+    }
+
+    private func selectAndClose() {
+        dismissThen(onSelectText)
+    }
+
+    private func recallAndClose() {
+        dismissThen(onRecall)
+    }
+
+    private func dismissThen(_ action: @escaping () -> Void) {
+        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: action)
     }
 }
 

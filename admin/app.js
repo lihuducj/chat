@@ -340,6 +340,7 @@ async function openConversation(c) {
   const res = await apiFetch('/api/conversations/' + c.id + '/messages');
   const msgs = await res.json();
   chatMessages.innerHTML = '';
+  delete chatMessages.dataset.lastMessageDay;
   msgs.forEach((message) => appendMessage(message));
   updateLastMessageReceipt(c);
   await waitForImages(chatMessages);
@@ -814,10 +815,37 @@ function linkify(text) {
 function fmtMsgTime(ts) {
   if (!ts) return '';
   const d = new Date(ts);
-  const now = new Date();
-  const hm = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-  const sameDay = d.toDateString() === now.toDateString();
-  return sameDay ? hm : d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) + ' ' + hm;
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+function messageDayKey(ts) {
+  const d = new Date(Number(ts) || Date.now());
+  return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-');
+}
+
+function fmtMessageDay(ts) {
+  const d = new Date(Number(ts) || Date.now());
+  const today = new Date();
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  if (messageDayKey(d.getTime()) === messageDayKey(today.getTime())) return '今天';
+  if (messageDayKey(d.getTime()) === messageDayKey(yesterday.getTime())) return '昨天';
+  return d.toLocaleDateString('zh-CN', {
+    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
+  });
+}
+
+function appendMessageDaySeparator(ts) {
+  const key = messageDayKey(ts);
+  if (chatMessages.dataset.lastMessageDay === key) return;
+  chatMessages.dataset.lastMessageDay = key;
+  const separator = document.createElement('div');
+  separator.className = 'msg-day-separator';
+  separator.setAttribute('role', 'separator');
+  separator.setAttribute('aria-label', '聊天日期：' + fmtMessageDay(ts));
+  const label = document.createElement('span');
+  label.textContent = fmtMessageDay(ts);
+  separator.appendChild(label);
+  chatMessages.appendChild(separator);
 }
 
 // ---------- 已读回执（只标最后一条客服消息）----------
@@ -938,8 +966,75 @@ imageLightboxImg.addEventListener('wheel', (e) => {
   });
 })();
 
+function isLongTextMessage(m) {
+  if (!m || m.type !== 'text' || m.recalled || !m.content) return false;
+  return m.content.length > 360 || m.content.split('\n').length > 8;
+}
+
+function openFullMessage(m) {
+  let overlay = document.getElementById('full-message-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'full-message-overlay';
+    overlay.className = 'full-message-overlay';
+    overlay.innerHTML = `
+      <section class="full-message-box" role="dialog" aria-modal="true" aria-labelledby="full-message-title">
+        <header class="full-message-header">
+          <strong id="full-message-title">完整消息</strong>
+          <button type="button" class="full-message-close" aria-label="关闭">✕</button>
+        </header>
+        <div class="full-message-content"></div>
+        <div class="full-message-meta"></div>
+        <footer class="full-message-actions"></footer>
+      </section>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('.full-message-close').onclick = () => overlay.classList.remove('show');
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) overlay.classList.remove('show');
+    });
+  }
+
+  const content = overlay.querySelector('.full-message-content');
+  content.innerHTML = linkify(m.content);
+  const meta = overlay.querySelector('.full-message-meta');
+  meta.textContent = fmtMessageDay(m.created_at) + ' ' + fmtMsgTime(m.created_at);
+  const actions = overlay.querySelector('.full-message-actions');
+  actions.innerHTML = '';
+
+  const quoteBtn = document.createElement('button');
+  quoteBtn.type = 'button';
+  quoteBtn.textContent = '引用';
+  quoteBtn.onclick = () => {
+    overlay.classList.remove('show');
+    setQuote(m.content);
+  };
+  actions.appendChild(quoteBtn);
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.textContent = '复制全文';
+  copyBtn.onclick = () => copyText(m.content, '全文已复制');
+  actions.appendChild(copyBtn);
+
+  if (m.sender === 'agent') {
+    const recallBtn = document.createElement('button');
+    recallBtn.type = 'button';
+    recallBtn.className = 'danger';
+    recallBtn.textContent = '撤回';
+    recallBtn.onclick = () => {
+      overlay.classList.remove('show');
+      recallMessage(m.id);
+    };
+    actions.appendChild(recallBtn);
+  }
+
+  overlay.classList.add('show');
+  overlay.querySelector('.full-message-close').focus();
+}
+
 function appendMessage(m, options) {
   const stickToBottom = Boolean(options && options.stickToBottom);
+  appendMessageDaySeparator(m.created_at);
   const row = document.createElement('div');
   row.className = 'msg-row' + (m.sender === 'agent' ? ' agent' : '');
   row.dataset.createdAt = m.created_at || 0;
@@ -965,6 +1060,31 @@ function appendMessage(m, options) {
     a.rel = 'noopener noreferrer';
     a.textContent = '📎 ' + (m.file_name || '文件');
     bubble.appendChild(a);
+  } else if (isLongTextMessage(m)) {
+    bubble.classList.add('long-text-bubble');
+    const preview = document.createElement('div');
+    preview.className = 'long-message-preview';
+    preview.textContent = m.content;
+    const openButton = document.createElement('button');
+    openButton.type = 'button';
+    openButton.className = 'long-message-open';
+    openButton.textContent = '查看全文 ↕';
+    openButton.onclick = (event) => {
+      event.stopPropagation();
+      openFullMessage(m);
+    };
+    bubble.appendChild(preview);
+    bubble.appendChild(openButton);
+    bubble.onclick = () => openFullMessage(m);
+    bubble.setAttribute('role', 'button');
+    bubble.setAttribute('tabindex', '0');
+    bubble.setAttribute('aria-label', '长消息，点按查看全文');
+    bubble.onkeydown = (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openFullMessage(m);
+      }
+    };
   } else {
     bubble.innerHTML = linkify(m.content);
   }
