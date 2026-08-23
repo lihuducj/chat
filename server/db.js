@@ -149,4 +149,34 @@ if (oldDefaultVisitors.length) {
   tx();
 }
 
+// 同一访客只能有一个正在进行的会话。升级前如果已经有重复open会话，保留最近活跃的
+// 那一条为open，其余只标记为closed；消息和会话记录都不删除。
+const visitorsWithDuplicateOpenConversations = db.prepare(`
+  SELECT visitor_id
+  FROM conversations
+  WHERE status = 'open'
+  GROUP BY visitor_id
+  HAVING COUNT(*) > 1
+`).all();
+if (visitorsWithDuplicateOpenConversations.length) {
+  const listOpen = db.prepare(`
+    SELECT id
+    FROM conversations
+    WHERE visitor_id = ? AND status = 'open'
+    ORDER BY COALESCE(last_message_at, created_at, 0) DESC, created_at DESC, rowid DESC
+  `);
+  const closeConversation = db.prepare("UPDATE conversations SET status = 'closed' WHERE id = ?");
+  const normalizeOpenConversations = db.transaction(() => {
+    visitorsWithDuplicateOpenConversations.forEach(({ visitor_id: visitorId }) => {
+      listOpen.all(visitorId).slice(1).forEach(({ id }) => closeConversation.run(id));
+    });
+  });
+  normalizeOpenConversations();
+}
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_one_open_per_visitor
+  ON conversations(visitor_id)
+  WHERE status = 'open'
+`);
+
 module.exports = db;

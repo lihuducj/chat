@@ -23,12 +23,41 @@
   }
 
   // ---------- 安全的本地存储读写：部分隐私模式/企业策略/内置浏览器会禁用localStorage，
-  // 直接调用可能抛错导致整个脚本中断，这里统一兜底 ----------
+  // 直接调用可能抛错导致整个脚本中断。localStorage不可用时退到当前标签页的
+  // sessionStorage；至少网络重连和当前标签页刷新时不会反复生成访客身份。 ----------
   function safeGet(key) {
-    try { return localStorage.getItem(key); } catch (e) { return null; }
+    try {
+      var localValue = localStorage.getItem(key);
+      if (localValue) return localValue;
+    } catch (e) {}
+    try { return sessionStorage.getItem(key); } catch (e2) { return null; }
   }
   function safeSet(key, value) {
-    try { localStorage.setItem(key, value); } catch (e) {}
+    try {
+      localStorage.setItem(key, value);
+      if (localStorage.getItem(key) === value) return true;
+    } catch (e) {}
+    try {
+      sessionStorage.setItem(key, value);
+      return sessionStorage.getItem(key) === value;
+    } catch (e2) {
+      return false;
+    }
+  }
+  function isSafeIdentityPart(value) {
+    return typeof value === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(value);
+  }
+  function randomHex(byteLength) {
+    try {
+      if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') return '';
+      var bytes = new Uint8Array(byteLength);
+      window.crypto.getRandomValues(bytes);
+      return Array.prototype.map.call(bytes, function (b) {
+        return b.toString(16).padStart(2, '0');
+      }).join('');
+    } catch (e) {
+      return '';
+    }
   }
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -73,6 +102,28 @@
   var STORAGE_KEY = 'myservice_visitor';
   var stored = {};
   try { stored = JSON.parse(safeGet(STORAGE_KEY) || '{}'); } catch (e) {}
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) stored = {};
+
+  // 首次访问时先由浏览器同步生成高强度随机身份，再发起网络连接。这样Socket.IO
+  // 即使在session_info返回前遇到断网重连，也不会再次拿空身份让服务器创建新访客。
+  // 老版本已经有visitorId但还没有secret时保留原ID，由服务器完成一次性安全升级。
+  if (!isSafeIdentityPart(stored.visitorId)) {
+    var initialVisitorId = randomHex(16);
+    var initialVisitorSecret = randomHex(32);
+    if (initialVisitorId && initialVisitorSecret) {
+      stored.visitorId = initialVisitorId;
+      stored.visitorSecret = initialVisitorSecret;
+      stored.conversationId = '';
+      safeSet(STORAGE_KEY, JSON.stringify(stored));
+      // 多标签页几乎同时首次打开时，以存储中最终可见的身份为准。
+      try {
+        var confirmedStored = JSON.parse(safeGet(STORAGE_KEY) || '{}');
+        if (isSafeIdentityPart(confirmedStored.visitorId) && isSafeIdentityPart(confirmedStored.visitorSecret)) {
+          stored = confirmedStored;
+        }
+      } catch (e) {}
+    }
+  }
 
   // ---------- 样式 ----------
   var style = document.createElement('style');
@@ -709,11 +760,18 @@
     socket = io(SERVER, {
       query: {
         role: 'visitor',
-        visitorId: stored.visitorId || '',
-        visitorSecret: stored.visitorSecret || '',
-        conversationId: stored.conversationId || '',
-        email: stored.email || '',
         url: location.href
+      },
+      // auth回调会在每一次初连和自动重连前重新执行，始终使用session_info
+      // 最近一次保存的身份，避免网络抖动时继续携带首次连接的空参数。
+      auth: function (callback) {
+        callback({
+          role: 'visitor',
+          visitorId: stored.visitorId || '',
+          visitorSecret: stored.visitorSecret || '',
+          conversationId: stored.conversationId || '',
+          email: stored.email || ''
+        });
       }
     });
     // 网络抖动会瞬时触发connect_error，Socket.IO自己会自动重连，

@@ -94,7 +94,13 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '128kb' }));
 app.use(cookieParser());
-app.use('/widget.js', express.static(path.join(__dirname, 'public', 'widget.js')));
+// widget是嵌到别的网站里的单文件脚本，修复身份/安全问题后必须尽快让所有访客拿到
+// 新版本，不能被浏览器或中间CDN长期缓存旧逻辑。
+app.get('/widget.js', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.sendFile(path.join(__dirname, 'public', 'widget.js'));
+});
 
 // ---------- 登录鉴权（session 持久化存数据库，服务重启不掉登录态） ----------
 const SESSION_TTL = 1000 * 60 * 60 * 24 * 180; // 180天，且每次使用会自动续期
@@ -621,7 +627,20 @@ app.patch('/api/conversations/:id', requireAuth, (req, res) => {
   }
   if (!fields.length) return res.json({ ok: true });
   params.id = req.params.id;
-  const result = db.prepare(`UPDATE conversations SET ${fields.join(', ')} WHERE id = @id`).run(params);
+  let result;
+  if (params.status === 'open') {
+    const reopenConversation = db.transaction(() => {
+      const target = db.prepare('SELECT visitor_id FROM conversations WHERE id = ?').get(params.id);
+      if (target) {
+        db.prepare("UPDATE conversations SET status = 'closed' WHERE visitor_id = ? AND id != ? AND status = 'open'")
+          .run(target.visitor_id, params.id);
+      }
+      return db.prepare(`UPDATE conversations SET ${fields.join(', ')} WHERE id = @id`).run(params);
+    });
+    result = reopenConversation();
+  } else {
+    result = db.prepare(`UPDATE conversations SET ${fields.join(', ')} WHERE id = @id`).run(params);
+  }
   if (!result.changes) return res.status(404).json({ error: 'conversation not found' });
   emitNativeEvent('conversation_updated', req.params.id);
   res.json({ ok: true });
@@ -679,8 +698,8 @@ function createAgentMessage(conversationId, payload) {
   const clean = sanitizeMessagePayload(payload);
   if (!clean || !conversationId) return { error: 'invalid message', status: 400 };
 
-  const convExists = db.prepare('SELECT id FROM conversations WHERE id = ?').get(conversationId);
-  if (!convExists) return { error: 'conversation not found', status: 404 };
+  const conversation = db.prepare('SELECT id, visitor_id FROM conversations WHERE id = ?').get(conversationId);
+  if (!conversation) return { error: 'conversation not found', status: 404 };
 
   const msg = {
     id: nanoid(),
@@ -693,10 +712,17 @@ function createAgentMessage(conversationId, payload) {
     created_at: Date.now(),
     recalled: 0
   };
-  db.prepare(`INSERT INTO messages (id, conversation_id, sender, type, content, file_name, file_size, created_at, recalled)
-    VALUES (@id, @conversation_id, @sender, @type, @content, @file_name, @file_size, @created_at, @recalled)`).run(msg);
-  db.prepare("UPDATE conversations SET last_message_at = ?, status = 'open' WHERE id = ?")
-    .run(msg.created_at, conversationId);
+  const saveAgentMessage = db.transaction(() => {
+    // 客服在一条已结束的历史会话中重新回复时，以当前选择的会话为准，先结束同一访客
+    // 其他进行中会话，再重新打开本会话，避免唯一索引冲突和重复open会话。
+    db.prepare("UPDATE conversations SET status = 'closed' WHERE visitor_id = ? AND id != ? AND status = 'open'")
+      .run(conversation.visitor_id, conversationId);
+    db.prepare(`INSERT INTO messages (id, conversation_id, sender, type, content, file_name, file_size, created_at, recalled)
+      VALUES (@id, @conversation_id, @sender, @type, @content, @file_name, @file_size, @created_at, @recalled)`).run(msg);
+    db.prepare("UPDATE conversations SET last_message_at = ?, status = 'open' WHERE id = ?")
+      .run(msg.created_at, conversationId);
+  });
+  saveAgentMessage();
 
   io.to(conversationId).to('agents').emit('new_message', msg);
   io.to('agents').emit('conversation_updated', { conversationId });
@@ -839,8 +865,15 @@ function isAnyAgentTrulyActive() {
 }
 
 // 客服端连接需要携带有效token/cookie，握手阶段就拦截，未授权时客户端会收到真正的 connect_error 事件
+function socketHandshakeIdentity(socket) {
+  return {
+    ...(socket.handshake.query || {}),
+    ...(socket.handshake.auth || {})
+  };
+}
+
 io.use((socket, next) => {
-  const { role, token } = socket.handshake.query;
+  const { role, token } = socketHandshakeIdentity(socket);
   if (role === 'agent') {
     const cookies = cookie.parse(socket.handshake.headers.cookie || '');
     const authToken = token || cookies.ms_session;
@@ -855,14 +888,45 @@ function genVisitorLabel() {
 }
 
 // 会话记录延迟创建：只有真的发了消息/填了联系方式才建库，避免访客只是路过没建立起真实的对话意向也留痕迹
-function ensureConversation(vId, convId) {
-  const exists = db.prepare('SELECT id FROM conversations WHERE id = ?').get(convId);
-  if (!exists) {
-    const now = Date.now();
-    db.prepare(`INSERT INTO conversations (id, visitor_id, status, created_at, last_message_at, unread_count)
-      VALUES (?, ?, 'open', ?, ?, 0)`).run(convId, vId, now, now);
+const ensureConversation = db.transaction((vId, requestedConversationId) => {
+  let requestedId = isSafeId(requestedConversationId) ? requestedConversationId : nanoid();
+  const requested = db.prepare('SELECT id, visitor_id, status FROM conversations WHERE id = ?').get(requestedId);
+
+  // 只能恢复当前访客自己的会话。若指定的是已结束会话，且没有其他进行中的会话，
+  // 就重新打开原会话，继续保留完整上下文。
+  if (requested && requested.visitor_id === vId) {
+    if (requested.status === 'open') return requested.id;
+    const existingOpen = db.prepare(
+      "SELECT id FROM conversations WHERE visitor_id = ? AND status = 'open' ORDER BY last_message_at DESC LIMIT 1"
+    ).get(vId);
+    if (existingOpen) return existingOpen.id;
+    db.prepare("UPDATE conversations SET status = 'open' WHERE id = ?").run(requested.id);
+    return requested.id;
   }
-}
+
+  const existingOpen = db.prepare(
+    "SELECT id FROM conversations WHERE visitor_id = ? AND status = 'open' ORDER BY last_message_at DESC LIMIT 1"
+  ).get(vId);
+  if (existingOpen) return existingOpen.id;
+
+  // requestedId如果已经属于别人就绝不能复用，换一个全新的随机ID。
+  if (requested) requestedId = nanoid();
+  const now = Date.now();
+  try {
+    db.prepare(`INSERT INTO conversations (id, visitor_id, status, created_at, last_message_at, unread_count)
+      VALUES (?, ?, 'open', ?, ?, 0)`).run(requestedId, vId, now, now);
+    return requestedId;
+  } catch (error) {
+    // 两个标签页同时发出第一条消息时，唯一索引只允许一个成功；另一个直接复用赢家。
+    if (error && String(error.code || '').startsWith('SQLITE_CONSTRAINT')) {
+      const winner = db.prepare(
+        "SELECT id FROM conversations WHERE visitor_id = ? AND status = 'open' ORDER BY last_message_at DESC LIMIT 1"
+      ).get(vId);
+      if (winner) return winner.id;
+    }
+    throw error;
+  }
+});
 
 const MAX_TEXT_LENGTH = 10000;
 const UPLOAD_PATH_RE = /^\/uploads\/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10}$/;
@@ -889,7 +953,7 @@ function sanitizeMessagePayload(payload) {
 }
 
 io.on('connection', (socket) => {
-  const { role, visitorId, visitorSecret, conversationId, name, email, url } = socket.handshake.query;
+  const { role, visitorId, visitorSecret, conversationId, name, email, url } = socketHandshakeIdentity(socket);
 
   if (role === 'agent') {
     onlineAgents.add(socket.id);
@@ -952,7 +1016,7 @@ io.on('connection', (socket) => {
       vSecret = nanoid(40);
       db.prepare('UPDATE visitors SET visitor_secret = ? WHERE id = ?').run(vSecret, vId);
       existingVisitor.visitor_secret = vSecret;
-    } else if (!existingVisitor) {
+    } else if (!existingVisitor && !vSecret) {
       vSecret = nanoid(40);
     }
 
@@ -988,7 +1052,20 @@ io.on('connection', (socket) => {
     convId = conv ? conv.id : nanoid();
 
     socket.join(convId);
-    socket.emit('session_info', { visitorId: vId, visitorSecret: vSecret, conversationId: convId });
+    function emitVisitorSession() {
+      socket.emit('session_info', { visitorId: vId, visitorSecret: vSecret, conversationId: convId });
+    }
+    function activateConversation() {
+      const activeConversationId = ensureConversation(vId, convId);
+      if (activeConversationId !== convId) {
+        socket.leave(convId);
+        convId = activeConversationId;
+        socket.join(convId);
+        emitVisitorSession();
+      }
+      return convId;
+    }
+    emitVisitorSession();
 
     // 把历史消息发给访客（重新打开widget时）；如果这个会话还没真正建库，这里自然查出空数组，没问题
     // 已撤回的消息不发给访客，不管是刚撤回还是很久以前撤回的，客户端永远看不到
@@ -999,7 +1076,7 @@ io.on('connection', (socket) => {
       const vName = cleanText(payload && payload.name, 80);
       const vEmail = cleanText(payload && payload.email, 254);
       if (!vName && !vEmail) return;
-      ensureConversation(vId, convId);
+      activateConversation();
       db.prepare('UPDATE visitors SET name = COALESCE(NULLIF(?, \'\'), name), email = COALESCE(NULLIF(?, \'\'), email) WHERE id = ?')
         .run(vName || '', vEmail || '', vId);
       io.to('agents').emit('conversation_updated', { conversationId: convId });
@@ -1035,7 +1112,7 @@ io.on('connection', (socket) => {
 
       const clean = sanitizeMessagePayload(payload);
       if (!clean) return;
-      ensureConversation(vId, convId);
+      activateConversation();
       const msg = {
         id: nanoid(),
         conversation_id: convId,
