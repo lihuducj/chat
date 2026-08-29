@@ -634,6 +634,7 @@ private struct ChatView: View {
                         .frame(width: 24, height: 30)
                 }
                 .accessibilityLabel(composerPanel == .tools ? "收起功能面板" : "更多功能")
+                .disabled(isSending)
 
                 TextField("输入消息", text: $draft, axis: .vertical)
                     .focused($composerFocused)
@@ -658,6 +659,7 @@ private struct ChatView: View {
                         .frame(width: 24, height: 30)
                 }
                 .accessibilityLabel(composerPanel == .emoji ? "收起表情面板" : "表情")
+                .disabled(isSending)
 
                 if isSending {
                     ProgressView()
@@ -901,8 +903,15 @@ private struct ChatView: View {
         do {
             let serverMessages = try await client.messages(conversationId: conversation.id)
             guard sequence == messageLoadSequence else { return }
-            let pending = messages.filter(\.isPending)
-            messages = (serverMessages + pending).sorted { $0.createdAt < $1.createdAt }
+            var pending = messages.filter(\.isPending)
+            for serverMessage in serverMessages where serverMessage.isAgent {
+                if let index = pending.firstIndex(where: {
+                    $0.type == serverMessage.type && $0.content == serverMessage.content
+                }) {
+                    pending.remove(at: index)
+                }
+            }
+            messages = deduplicatedMessages(serverMessages + pending)
             liveConversation = try await client.conversation(id: conversation.id)
             try? await client.markRead(conversationId: conversation.id)
             if showError { errorMessage = nil }
@@ -948,7 +957,7 @@ private struct ChatView: View {
                 if !messages.contains(where: { $0.id == message.id }) {
                     messages.append(message)
                 }
-                messages.sort { $0.createdAt < $1.createdAt }
+                messages = deduplicatedMessages(messages)
                 errorMessage = nil
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
             } catch {
@@ -962,6 +971,7 @@ private struct ChatView: View {
     }
 
     private func uploadPhoto(_ item: PhotosPickerItem) {
+        guard !isSending else { return }
         isSending = true
         Task {
             defer {
@@ -969,11 +979,15 @@ private struct ChatView: View {
                 photoItem = nil
             }
             do {
-                guard let raw = try await item.loadTransferable(type: Data.self),
-                      let image = UIImage(data: raw),
-                      let jpeg = image.jpegData(compressionQuality: 0.88) else {
+                guard let raw = try await item.loadTransferable(type: Data.self) else {
                     throw AppClientError.invalidResponse
                 }
+                let jpeg = try await Task.detached(priority: .userInitiated) {
+                    guard let optimized = Self.optimizedJPEG(fromImageData: raw) else {
+                        throw AppClientError.invalidResponse
+                    }
+                    return optimized
+                }.value
                 try await uploadAndSend(data: jpeg, fileName: "photo-\(Int(Date().timeIntervalSince1970)).jpg", mimeType: "image/jpeg")
             } catch {
                 errorMessage = error.localizedDescription
@@ -982,13 +996,17 @@ private struct ChatView: View {
     }
 
     private func uploadCameraImage(_ image: UIImage) {
+        guard !isSending else { return }
         isSending = true
         Task {
             defer { isSending = false }
             do {
-                guard let jpeg = image.jpegData(compressionQuality: 0.88) else {
-                    throw AppClientError.invalidResponse
-                }
+                let jpeg = try await Task.detached(priority: .userInitiated) {
+                    guard let optimized = Self.optimizedJPEG(from: image) else {
+                        throw AppClientError.invalidResponse
+                    }
+                    return optimized
+                }.value
                 try await uploadAndSend(data: jpeg, fileName: "camera-\(Int(Date().timeIntervalSince1970)).jpg", mimeType: "image/jpeg")
             } catch {
                 errorMessage = error.localizedDescription
@@ -997,6 +1015,7 @@ private struct ChatView: View {
     }
 
     private func uploadFile(_ url: URL) {
+        guard !isSending else { return }
         isSending = true
         Task {
             defer { isSending = false }
@@ -1036,8 +1055,63 @@ private struct ChatView: View {
             isReviewingMessageHistory = false
             messages.append(message)
         }
-        messages.sort { $0.createdAt < $1.createdAt }
+        messages = deduplicatedMessages(messages)
         errorMessage = nil
+    }
+
+    nonisolated private static func optimizedJPEG(from image: UIImage) -> Data? {
+        autoreleasepool {
+            let targetBytes = 900 * 1024
+            let dimensions: [CGFloat] = [2048, 1600, 1280, 1024]
+            let qualities: [CGFloat] = [0.82, 0.72, 0.62, 0.52, 0.42]
+            var smallestData: Data?
+
+            for dimension in dimensions {
+                guard let resized = resizedImage(image, maxPixelDimension: dimension) else { continue }
+                for quality in qualities {
+                    guard let data = resized.jpegData(compressionQuality: quality) else { continue }
+                    if smallestData == nil || data.count < smallestData!.count { smallestData = data }
+                    if data.count <= targetBytes { return data }
+                }
+            }
+            return smallestData
+        }
+    }
+
+    nonisolated private static func optimizedJPEG(fromImageData data: Data) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 2048,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return optimizedJPEG(from: UIImage(cgImage: cgImage))
+    }
+
+    nonisolated private static func resizedImage(_ image: UIImage, maxPixelDimension: CGFloat) -> UIImage? {
+        let pixelWidth = image.size.width * image.scale
+        let pixelHeight = image.size.height * image.scale
+        let longestSide = max(pixelWidth, pixelHeight)
+        guard longestSide > 0 else { return nil }
+        let ratio = min(1, maxPixelDimension / longestSide)
+        let targetSize = CGSize(
+            width: max(1, (pixelWidth * ratio).rounded()),
+            height: max(1, (pixelHeight * ratio).rounded())
+        )
+        if ratio >= 0.999, image.scale == 1 { return image }
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(size: targetSize, format: format).image { context in
+            context.cgContext.setFillColor(UIColor.white.cgColor)
+            context.cgContext.fill(CGRect(origin: .zero, size: targetSize))
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
     }
 
     private func recall(_ message: ChatMessage) {
@@ -1113,7 +1187,7 @@ private struct ChatView: View {
                 if !messages.contains(where: { $0.id == message.id }) {
                     messages.append(message)
                 }
-                messages.sort { $0.createdAt < $1.createdAt }
+                messages = deduplicatedMessages(messages)
             }
             Task {
                 guard let client = appState.client else { return }
@@ -1156,6 +1230,16 @@ private struct ChatView: View {
         otherUnreadCount = allConversations
             .filter { $0.id != conversation.id }
             .reduce(0) { $0 + max(0, $1.unreadCount) }
+    }
+
+    private func deduplicatedMessages(_ source: [ChatMessage]) -> [ChatMessage] {
+        var seen = Set<String>()
+        return source
+            .sorted { lhs, rhs in
+                if lhs.createdAt == rhs.createdAt { return lhs.id < rhs.id }
+                return lhs.createdAt < rhs.createdAt
+            }
+            .filter { seen.insert($0.id).inserted }
     }
 
     private func receiptState(for message: ChatMessage) -> MessageReceipt? {
@@ -1257,6 +1341,14 @@ private final class PersistentImageLoader: ObservableObject {
 
     private let url: URL
     private let maxPixelSize: Int
+    private var memoryCacheKey: NSString { "\(url.absoluteString)#\(maxPixelSize)" as NSString }
+
+    private static let decodedImageCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 120
+        cache.totalCostLimit = 80 * 1024 * 1024
+        return cache
+    }()
 
     private static let cache = URLCache(
         memoryCapacity: 32 * 1024 * 1024,
@@ -1284,6 +1376,10 @@ private final class PersistentImageLoader: ObservableObject {
     func load(forceRefresh: Bool = false) async {
         guard !isLoading else { return }
         if image != nil, !forceRefresh { return }
+        if !forceRefresh, let cachedImage = Self.decodedImageCache.object(forKey: memoryCacheKey) {
+            image = cachedImage
+            return
+        }
         isLoading = true
         failed = false
         defer { isLoading = false }
@@ -1295,6 +1391,7 @@ private final class PersistentImageLoader: ObservableObject {
         if !forceRefresh,
            let cached = Self.cache.cachedResponse(for: request),
            let decoded = await Self.decode(cached.data, maxPixelSize: maxPixelSize) {
+            Self.decodedImageCache.setObject(decoded, forKey: memoryCacheKey, cost: Self.imageCost(decoded))
             image = decoded
             return
         }
@@ -1309,6 +1406,7 @@ private final class PersistentImageLoader: ObservableObject {
                     throw URLError(.cannotDecodeContentData)
                 }
                 Self.cache.storeCachedResponse(CachedURLResponse(response: response, data: data), for: request)
+                Self.decodedImageCache.setObject(decoded, forKey: memoryCacheKey, cost: Self.imageCost(decoded))
                 image = decoded
                 return
             } catch {
@@ -1338,6 +1436,10 @@ private final class PersistentImageLoader: ObservableObject {
             }
             return UIImage(cgImage: cgImage)
         }.value
+    }
+
+    nonisolated private static func imageCost(_ image: UIImage) -> Int {
+        Int(image.size.width * image.scale * image.size.height * image.scale * 4)
     }
 }
 

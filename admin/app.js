@@ -3,6 +3,9 @@ const TOKEN_KEY = 'ms_token';
 let activeConvId = null;
 let conversations = [];
 let socket = null;
+let openConversationSeq = 0;
+const renderedMessageIds = new Set();
+let conversationLoadBuffer = null;
 
 // ---------- 登录 / token 鉴权 ----------
 // 用 localStorage 存 token，每次请求自己带上，不依赖 Cookie。
@@ -20,6 +23,27 @@ function clearToken() {
 function authHeaders(extra) {
   const token = getToken();
   return Object.assign({}, extra || {}, token ? { Authorization: 'Bearer ' + token } : {});
+}
+
+function makeClientMessageId(prefix) {
+  const random = window.crypto && typeof window.crypto.randomUUID === 'function'
+    ? window.crypto.randomUUID()
+    : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  return (prefix || 'web') + '-' + random;
+}
+
+function sendAgentSocketMessage(payload, onFailure, attempt) {
+  const currentAttempt = attempt || 0;
+  socket.timeout(10000).emit('agent_message', payload, (timeoutError, response) => {
+    if (!timeoutError && response && response.ok) return;
+    if (currentAttempt < 2) {
+      setTimeout(() => sendAgentSocketMessage(payload, onFailure, currentAttempt + 1), 450 + currentAttempt * 700);
+      return;
+    }
+    if (onFailure) {
+      onFailure(response && response.error ? response.error : '消息发送失败，请检查网络后重试');
+    }
+  });
 }
 async function apiFetch(path, options) {
   options = options || {};
@@ -166,7 +190,7 @@ document.getElementById('search-input').addEventListener('input', (e) => {
   const v = e.target.value;
   searchDebounce = setTimeout(() => {
     searchQuery = v.trim();
-    loadConversations();
+    loadConversations().catch(() => {});
   }, 300);
 });
 
@@ -311,7 +335,7 @@ function renderConvList() {
 
     inner.onclick = () => {
       if (openSwipeItem === inner) { closeOpenSwipe(); return; } // 划开状态下点一下先收起，不直接打开
-      openConversation(c);
+      openConversation(c).catch(() => {});
     };
 
     el.appendChild(delBtn);
@@ -321,6 +345,9 @@ function renderConvList() {
 }
 
 async function openConversation(c) {
+  const seq = ++openConversationSeq;
+  const conversationId = c.id;
+  conversationLoadBuffer = { sequence: seq, conversationId, messages: [] };
   activeConvId = c.id;
   visitorNameEl.textContent = visitorLabel(c);
   visitorNameEl.dataset.email = c.visitor_email || '';
@@ -344,17 +371,48 @@ async function openConversation(c) {
   document.getElementById('notes-input').value = c.notes || '';
   document.getElementById('meta-panel').style.display = 'none';
 
-  socket.emit('join_conversation', c.id);
-  const res = await apiFetch('/api/conversations/' + c.id + '/messages');
-  const msgs = await res.json();
+  socket.emit('join_conversation', conversationId);
+  let msgs;
+  try {
+    const res = await apiFetch('/api/conversations/' + conversationId + '/messages');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    msgs = await res.json();
+    if (!Array.isArray(msgs)) throw new Error('数据格式错误');
+  } catch (error) {
+    if (seq === openConversationSeq && activeConvId === conversationId) {
+      const buffered = conversationLoadBuffer && conversationLoadBuffer.sequence === seq
+        ? conversationLoadBuffer.messages.slice()
+        : [];
+      conversationLoadBuffer = null;
+      chatMessages.innerHTML = '<div class="chat-load-error">消息加载失败，请检查网络后重新进入会话</div>';
+      renderedMessageIds.clear();
+      buffered.forEach((message) => appendMessage(message));
+    }
+    return;
+  }
+  if (seq !== openConversationSeq || activeConvId !== conversationId) return;
+  const buffered = conversationLoadBuffer && conversationLoadBuffer.sequence === seq
+    ? conversationLoadBuffer.messages
+    : [];
+  conversationLoadBuffer = null;
+  const messagesById = new Map();
+  msgs.concat(buffered).forEach((message) => {
+    if (message && message.id) messagesById.set(message.id, message);
+  });
+  msgs = Array.from(messagesById.values()).sort((left, right) => {
+    const timeDifference = Number(left.created_at || 0) - Number(right.created_at || 0);
+    return timeDifference || String(left.id).localeCompare(String(right.id));
+  });
   chatMessages.innerHTML = '';
+  renderedMessageIds.clear();
   delete chatMessages.dataset.lastMessageDay;
   msgs.forEach((message) => appendMessage(message));
   updateLastMessageReceipt(c);
   await waitForImages(chatMessages);
+  if (seq !== openConversationSeq || activeConvId !== conversationId) return;
   scrollToBottom();
   adjustForKeyboard(); // 打开会话、批量渲染完历史消息之后，只统一校正一次，不要每条消息都触发一次(会卡)
-  markRead(c.id);
+  markRead(conversationId);
   renderConvList();
 }
 
@@ -1063,6 +1121,8 @@ function openFullMessage(m) {
 }
 
 function appendMessage(m, options) {
+  if (m && m.id && renderedMessageIds.has(m.id)) return false;
+  if (m && m.id) renderedMessageIds.add(m.id);
   const stickToBottom = Boolean(options && options.stickToBottom);
   appendMessageDaySeparator(m.created_at);
   const row = document.createElement('div');
@@ -1132,7 +1192,7 @@ function appendMessage(m, options) {
     col.appendChild(timeEl);
     row.appendChild(col);
     chatMessages.appendChild(row);
-    return;
+    return true;
   }
 
   // 消息操作行：长文本(超过40字)带复制按钮；文字消息都带引用按钮；客服自己发的消息带撤回按钮
@@ -1176,6 +1236,7 @@ function appendMessage(m, options) {
   row.appendChild(col);
   chatMessages.appendChild(row);
   if (stickToBottom) scrollToBottom();
+  return true;
 }
 
 // ---------- 引用回复 ----------
@@ -1217,8 +1278,22 @@ document.getElementById('quote-bar-close').onclick = clearQuote;
 function sendText() {
   const v = chatInput.value.trim();
   if (!v || !activeConvId) return;
-  const content = quotedText ? `「${quotedText}」\n${v}` : v;
-  socket.emit('agent_message', { conversationId: activeConvId, type: 'text', content });
+  const quoteSnapshot = quotedText;
+  const content = quoteSnapshot ? `「${quoteSnapshot}」\n${v}` : v;
+  const payload = {
+    conversationId: activeConvId,
+    type: 'text',
+    content,
+    clientMessageId: makeClientMessageId('web')
+  };
+  sendAgentSocketMessage(payload, (message) => {
+    if (!chatInput.value.trim()) {
+      chatInput.value = v;
+      autoGrowChatInput();
+    }
+    if (quoteSnapshot && !quotedText) setQuote(quoteSnapshot);
+    alert(message);
+  });
   chatInput.value = '';
   autoGrowChatInput(); // 发完把输入框高度缩回单行，不然还保持着之前多行文字撑开的高度
   chatInput.focus(); // 发完不失焦，键盘保持打开，方便连续回复
@@ -1239,26 +1314,50 @@ function autoGrowChatInput() {
 }
 chatInput.addEventListener('input', autoGrowChatInput);
 
-document.getElementById('attach-btn').onclick = () => document.getElementById('file-input').click();
-document.getElementById('file-input').addEventListener('change', async (e) => {
+const attachBtn = document.getElementById('attach-btn');
+const fileInput = document.getElementById('file-input');
+let attachmentUploading = false;
+attachBtn.onclick = () => {
+  if (!attachmentUploading) fileInput.click();
+};
+fileInput.addEventListener('change', async (e) => {
   const f = e.target.files[0];
-  if (!f || !activeConvId) return;
+  const targetConversationId = activeConvId;
+  if (!f || !targetConversationId || attachmentUploading) return;
+  if (f.size > 20 * 1024 * 1024) {
+    alert('文件不能超过 20MB');
+    e.target.value = '';
+    return;
+  }
+  attachmentUploading = true;
+  attachBtn.disabled = true;
+  attachBtn.classList.add('uploading');
   const fd = new FormData();
   fd.append('file', f);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90000);
   try {
-    const res = await fetch(SERVER + '/api/upload', { method: 'POST', headers: authHeaders(), body: fd });
-    const data = await res.json();
+    const res = await fetch(SERVER + '/api/upload', {
+      method: 'POST', headers: authHeaders(), body: fd, signal: controller.signal
+    });
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       alert(data.error || '上传失败');
       return;
     }
-    socket.emit('agent_message', {
-      conversationId: activeConvId, type: data.type, content: data.url,
-      fileName: data.name, fileSize: data.size
+    sendAgentSocketMessage({
+      conversationId: targetConversationId, type: data.type, content: data.url,
+      fileName: data.name, fileSize: data.size, clientMessageId: makeClientMessageId('web')
+    }, (message) => {
+      alert(message);
     });
   } catch (err) {
-    alert('上传失败，请检查网络');
+    alert(err && err.name === 'AbortError' ? '上传超时，请检查网络后重试' : '上传失败，请检查网络');
   } finally {
+    clearTimeout(timeout);
+    attachmentUploading = false;
+    attachBtn.disabled = false;
+    attachBtn.classList.remove('uploading');
     e.target.value = '';
   }
 });
@@ -1341,14 +1440,14 @@ function fmtTime(ts) {
 
 // ---------- PWA ----------
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js?v=5', { scope: './', updateViaCache: 'none' })
+  navigator.serviceWorker.register('sw.js?v=6', { scope: './', updateViaCache: 'none' })
     .then((registration) => registration.update())
     .catch(() => {});
   // App已经开着的时候点推送通知，Service Worker会用postMessage告诉页面切到指定会话，
   // 不产生任何页面跳转（避免历史记录堆积、避免触发iOS独立App模式那个跳出scope弹简化浏览器的问题）
   navigator.serviceWorker.addEventListener('message', async (event) => {
     if (event.data && event.data.type === 'open-conversation' && event.data.conversationId) {
-      await loadConversations(); // 保险起见先刷新一次，避免是条还没同步到本地列表里的新会话
+      try { await loadConversations(); } catch (error) { return; } // 保险起见先刷新一次
       const target = conversations.find((c) => c.id === event.data.conversationId);
       if (target) {
         await openConversation(target);
@@ -1517,13 +1616,13 @@ function startSocket() {
     // 断线重连后，服务器不会记得之前加入过哪个会话房间，这里手动补一次，
     // 不然重连后正开着的会话收不到新消息推送，得手动切换会话才能刷新出来
     if (activeConvId) socket.emit('join_conversation', activeConvId);
-    await loadConversations();
+    try { await loadConversations(); } catch (error) { return; }
     // 之前只刷新了列表，没刷新"正开着的这个会话"本身的消息内容——
     // 从后台切回来、期间客户回复了消息的话，这里必须重新拉一次完整消息，
     // 不然聊天窗里显示的还是切到后台之前的旧状态，得等再发一条消息才会刷新，体验上就是"卡住了"
     if (activeConvId) {
       const activeConv = conversations.find((c) => c.id === activeConvId);
-      if (activeConv) openConversation(activeConv);
+      if (activeConv) openConversation(activeConv).catch(() => {});
     }
   });
   socket.on('disconnect', () => connDot.classList.remove('online'));
@@ -1538,9 +1637,15 @@ function startSocket() {
 
   socket.on('new_message', (m) => {
     if (m.conversation_id === activeConvId) {
-      const shouldStickToBottom = m.sender === 'agent' || isChatNearBottom();
-      appendMessage(m, { stickToBottom: shouldStickToBottom });
-      if (shouldStickToBottom) adjustForKeyboard();
+      const isLoadingActiveConversation = conversationLoadBuffer
+        && conversationLoadBuffer.conversationId === activeConvId;
+      if (isLoadingActiveConversation) {
+        conversationLoadBuffer.messages.push(m);
+      } else {
+        const shouldStickToBottom = m.sender === 'agent' || isChatNearBottom();
+        const appended = appendMessage(m, { stickToBottom: shouldStickToBottom });
+        if (appended && shouldStickToBottom) adjustForKeyboard();
+      }
       markRead(activeConvId);
     } else if (m.sender === 'visitor') {
       flashTitle();
@@ -1549,14 +1654,16 @@ function startSocket() {
       justUpdatedClearTimer = setTimeout(() => { justUpdatedConvId = null; }, 1500); // 延迟清除，别被几乎同时到达的conversation_updated触发的另一次渲染抢先覆盖掉
     }
     if (m.sender === 'visitor') playNotifySound();
-    loadConversations();
+    loadConversations().catch(() => {});
   });
 
-  socket.on('conversation_updated', () => loadConversations());
+  socket.on('conversation_updated', () => loadConversations().catch(() => {}));
 
   socket.on('conversation_deleted', ({ conversationId }) => {
     conversations = conversations.filter((x) => x.id !== conversationId);
     if (activeConvId === conversationId) {
+      openConversationSeq++;
+      conversationLoadBuffer = null;
       activeConvId = null;
       chatActive.style.display = 'none';
       emptyState.style.display = 'flex';
@@ -1598,10 +1705,10 @@ function startSocket() {
   // 这里直接绑定系统级的"回到前台"信号，不管Socket重连快不快，都主动去拉一次最新数据
   document.addEventListener('visibilitychange', async () => {
     if (document.hidden) return;
-    await loadConversations();
+    try { await loadConversations(); } catch (error) { return; }
     if (activeConvId) {
       const activeConv = conversations.find((c) => c.id === activeConvId);
-      if (activeConv) openConversation(activeConv);
+      if (activeConv) openConversation(activeConv).catch(() => {});
     }
   });
 
@@ -1638,7 +1745,7 @@ function showStartupError(error) {
 checkAuth().then(async () => {
   startSocket();
   await loadConversations();
-  setInterval(() => loadConversations(), 15000); // 兜底轮询
+  setInterval(() => loadConversations().catch(() => {}), 15000); // 兜底轮询
 
   const params = new URLSearchParams(location.search);
   const convId = params.get('conv');

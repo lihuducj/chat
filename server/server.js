@@ -15,7 +15,9 @@ const { Server } = require('socket.io');
 const db = require('./db');
 
 const app = express();
-app.set('trust proxy', true); // 部署在Nginx/宝塔反代后面，这样req.ip才是访客真实IP而不是127.0.0.1
+// 线上只有一层 Nginx/宝塔反代。限定一层能让 req.ip 取到真实访客 IP，
+// 又不会像 `true` 那样信任客户端自己伪造的整条 X-Forwarded-For。
+app.set('trust proxy', 1);
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -167,9 +169,14 @@ function cleanText(value, maxLength) {
 
 function socketClientIP(socket) {
   const headers = socket.handshake.headers || {};
-  const forwarded = cleanText(headers['x-forwarded-for'], 500).split(',')[0].trim();
+  const forwardedParts = cleanText(headers['x-forwarded-for'], 500).split(',').map((part) => part.trim()).filter(Boolean);
+  const forwarded = forwardedParts[forwardedParts.length - 1] || '';
   const realIP = cleanText(headers['x-real-ip'], 100);
-  return cleanText(forwarded || realIP || socket.handshake.address || '', 100);
+  return cleanText(realIP || forwarded || socket.handshake.address || '', 100);
+}
+
+function requestClientIP(req) {
+  return cleanText(req.ip || req.socket.remoteAddress || '', 100) || 'unknown';
 }
 
 function isSafeId(value) {
@@ -183,10 +190,16 @@ function hasValidVisitorIdentity(visitorId, visitorSecret) {
 }
 
 function requireUploadIdentity(req, res, next) {
-  if (isValidSession(getTokenFromReq(req))) return next();
+  if (isValidSession(getTokenFromReq(req))) {
+    req.uploadActor = 'agent';
+    return next();
+  }
   const visitorId = req.get('X-Visitor-Id') || '';
   const visitorSecret = req.get('X-Visitor-Secret') || '';
-  if (hasValidVisitorIdentity(visitorId, visitorSecret)) return next();
+  if (hasValidVisitorIdentity(visitorId, visitorSecret)) {
+    req.uploadActor = 'visitor';
+    return next();
+  }
   return res.status(401).json({ error: '上传身份已失效，请刷新聊天窗口后重试' });
 }
 
@@ -241,7 +254,7 @@ app.post('/api/native/presence', requireAuth, (req, res) => {
 });
 
 app.post('/api/login', (req, res) => {
-  const ip = req.ip || 'unknown';
+  const ip = requestClientIP(req);
   const now = Date.now();
   const attempt = loginAttempts.get(ip);
   if (attempt && attempt.lockedUntil > now) {
@@ -334,18 +347,25 @@ const upload = multer({
 });
 
 app.post('/api/upload', requireUploadIdentity, (req, res) => {
-  const ip = req.ip || 'unknown';
+  const ip = requestClientIP(req);
+  const attemptKey = `${req.uploadActor || 'unknown'}:${ip}`;
+  const uploadLimit = req.uploadActor === 'agent' ? 60 : 12;
   const now = Date.now();
-  const record = uploadAttempts.get(ip) || [];
+  const record = uploadAttempts.get(attemptKey) || [];
   const recent = record.filter((t) => now - t < 5 * 60 * 1000);
-  if (recent.length >= 12) {
+  if (recent.length >= uploadLimit) {
     return res.status(429).json({ error: '上传太频繁，请稍后再试' });
   }
   recent.push(now);
-  uploadAttempts.set(ip, recent);
+  uploadAttempts.set(attemptKey, recent);
 
   upload.single('file')(req, res, (err) => {
-    if (err) return res.status(400).json({ error: err.message === '不支持的文件类型' ? err.message : '上传失败' });
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: '文件不能超过 20MB' });
+      }
+      return res.status(400).json({ error: err.message === '不支持的文件类型' ? err.message : '上传失败' });
+    }
     if (!req.file) return res.status(400).json({ error: 'no file' });
     const isImage = /^image\//.test(req.file.mimetype);
     res.json({
@@ -708,8 +728,21 @@ function createAgentMessage(conversationId, payload) {
   const conversation = db.prepare('SELECT id, visitor_id FROM conversations WHERE id = ?').get(conversationId);
   if (!conversation) return { error: 'conversation not found', status: 404 };
 
+  // 客户端在网络超时后会用同一个ID重试。若第一次其实已经成功写库，直接返回原消息，
+  // 不再新增和广播第二条，从协议层解决图片/文字偶发重复。
+  const requestedMessageId = isSafeId(payload && payload.clientMessageId) ? payload.clientMessageId : '';
+  if (requestedMessageId) {
+    const existing = db.prepare('SELECT * FROM messages WHERE id = ?').get(requestedMessageId);
+    if (existing) {
+      if (existing.conversation_id === conversationId && existing.sender === 'agent') {
+        return { message: existing };
+      }
+      return { error: 'message id conflict', status: 409 };
+    }
+  }
+
   const msg = {
-    id: nanoid(),
+    id: requestedMessageId || nanoid(),
     conversation_id: conversationId,
     sender: 'agent',
     type: clean.type,
@@ -991,9 +1024,19 @@ io.on('connection', (socket) => {
       }
     });
 
-    socket.on('agent_message', (payload) => {
-      const { conversationId } = payload || {};
-      createAgentMessage(conversationId, payload || {});
+    socket.on('agent_message', (payload, acknowledge) => {
+      try {
+        const { conversationId } = payload || {};
+        const result = createAgentMessage(conversationId, payload || {});
+        if (typeof acknowledge === 'function') {
+          acknowledge(result.error
+            ? { ok: false, error: result.error }
+            : { ok: true, messageId: result.message.id });
+        }
+      } catch (error) {
+        console.error('❌ 客服消息保存失败:', error.message);
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: '消息发送失败' });
+      }
     });
 
     // 撤回消息：只能撤回客服自己发的消息，不能撤回访客发的
@@ -1112,18 +1155,38 @@ io.on('connection', (socket) => {
     });
 
     let msgTimestamps = [];
-    socket.on('visitor_message', (payload) => {
+    socket.on('visitor_message', (payload, acknowledge) => {
+      try {
       // 简单防刷：10秒内超过15条消息就先丢弃，防止恶意脚本刷爆数据库和Bark推送
       const now2 = Date.now();
       msgTimestamps = msgTimestamps.filter((t) => now2 - t < 10000);
-      if (msgTimestamps.length >= 15) return;
+      if (msgTimestamps.length >= 15) {
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: '发送太频繁，请稍后再试' });
+        return;
+      }
       msgTimestamps.push(now2);
 
       const clean = sanitizeMessagePayload(payload);
-      if (!clean) return;
+      if (!clean) {
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: '消息内容无效' });
+        return;
+      }
       activateConversation();
+      const requestedMessageId = isSafeId(payload && payload.clientMessageId) ? payload.clientMessageId : '';
+      if (requestedMessageId) {
+        const existing = db.prepare('SELECT * FROM messages WHERE id = ?').get(requestedMessageId);
+        if (existing) {
+          if (existing.conversation_id === convId && existing.sender === 'visitor') {
+            socket.emit('new_message', existing);
+            if (typeof acknowledge === 'function') acknowledge({ ok: true, messageId: existing.id });
+          } else if (typeof acknowledge === 'function') {
+            acknowledge({ ok: false, error: '消息ID冲突' });
+          }
+          return;
+        }
+      }
       const msg = {
-        id: nanoid(),
+        id: requestedMessageId || nanoid(),
         conversation_id: convId,
         sender: 'visitor',
         type: clean.type,
@@ -1146,6 +1209,11 @@ io.on('connection', (socket) => {
       // App 进入后台会立即上报；上报失败时 15 秒心跳过期后自动恢复 Bark，避免长期漏通知。
       if (!isNativeAppForeground()) pushToBark('新客服消息', preview, convId);
       pushWebPush('新客服消息', preview, convId);
+      if (typeof acknowledge === 'function') acknowledge({ ok: true, messageId: msg.id });
+      } catch (error) {
+        console.error('❌ 访客消息保存失败:', error.message);
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: '消息发送失败，请重试' });
+      }
     });
   }
 });

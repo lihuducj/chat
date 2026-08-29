@@ -194,6 +194,7 @@
     #ms-input { flex: 1; border: 1px solid var(--ms-bubble-border); background: var(--ms-input-bg); color: var(--ms-text);
       border-radius: 20px; padding: 8px 14px; font-size: 16px; outline: none; min-width: 0; }
     #ms-send, #ms-attach, #ms-emoji { background: none; border: none; cursor: pointer; color: ${PRIMARY}; padding: 6px; flex-shrink: 0; }
+    #ms-send:disabled, #ms-attach:disabled, #ms-emoji:disabled { opacity: .4; cursor: default; }
     #ms-send svg, #ms-attach svg { width: 20px; height: 20px; fill: currentColor; }
     #ms-emoji { font-size: 18px; line-height: 1; }
     #ms-emoji-popup { position: absolute; bottom: 56px; left: 10px; width: 220px; max-height: 180px; overflow-y: auto;
@@ -338,6 +339,10 @@
   var badge = document.getElementById('ms-badge');
   var inputEl = document.getElementById('ms-input');
   var fileEl = document.getElementById('ms-file');
+  var attachEl = document.getElementById('ms-attach');
+  var renderedMessageIds = new Set();
+  var visitorSessionReady = false;
+  var attachmentUploading = false;
   var unread = 0;
   var isOpen = false;
   var socket; // 提升到这一层作用域，Socket.IO脚本加载完成后才会真正赋值
@@ -560,7 +565,11 @@
     safeSet(THEME_KEY, !isDark ? 'dark' : 'light');
   };
 
-  document.getElementById('ms-attach').onclick = function (e) { e.stopPropagation(); fileEl.click(); };
+  attachEl.disabled = true;
+  attachEl.onclick = function (e) {
+    e.stopPropagation();
+    if (visitorSessionReady && !attachmentUploading) fileEl.click();
+  };
   panel.onclick = function (e) {
     if (emojiPopup.classList.contains('show') && !emojiPopup.contains(e.target) && e.target.id !== 'ms-emoji') {
       emojiPopup.classList.remove('show');
@@ -676,6 +685,8 @@
   }
 
   function renderMessage(m) {
+    if (m && m.id && renderedMessageIds.has(m.id)) return false;
+    if (m && m.id) renderedMessageIds.add(m.id);
     var row = document.createElement('div');
     row.className = 'ms-row' + (m.sender === 'visitor' ? ' me' : '');
     row.setAttribute('data-msg-id', m.id);
@@ -706,6 +717,7 @@
     row.appendChild(col);
     messagesEl.appendChild(row);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    return true;
   }
 
   function linkify(text) {
@@ -807,7 +819,13 @@
     // 等5秒确认真的连不上了再提示，避免误报；一旦重连成功就把提示清掉
     var errorTimer = null;
     socket.on('connect_error', function () {
+      visitorSessionReady = false;
+      attachEl.disabled = true;
       if (!errorTimer) errorTimer = setTimeout(onLoadFail, 5000);
+    });
+    socket.on('disconnect', function () {
+      visitorSessionReady = false;
+      attachEl.disabled = true;
     });
     socket.on('connect', function () {
       clearTimeout(errorTimer);
@@ -820,9 +838,15 @@
       stored.visitorSecret = data.visitorSecret;
       stored.conversationId = data.conversationId;
       safeSet(STORAGE_KEY, JSON.stringify(stored));
+      visitorSessionReady = true;
+      attachEl.disabled = attachmentUploading;
     });
 
     socket.on('history', function (msgs) {
+      Array.prototype.slice.call(messagesEl.querySelectorAll('.ms-row[data-msg-id]')).forEach(function (row) {
+        if (row.parentNode) row.parentNode.removeChild(row);
+      });
+      renderedMessageIds.clear();
       msgs.forEach(renderMessage);
       if (msgs.some(function (m) { return m.sender === 'agent'; })) {
         socket.emit(isConversationVisible() ? 'visitor_read' : 'visitor_delivered');
@@ -835,11 +859,13 @@
     socket.on('message_recalled', function (data) {
       var el = messagesEl.querySelector('[data-msg-id="' + data.messageId + '"]');
       if (el) el.parentNode.removeChild(el);
+      renderedMessageIds.delete(data.messageId);
     });
 
     socket.on('new_message', function (m) {
       hideMenuView();
-      renderMessage(m);
+      var appended = renderMessage(m);
+      if (!appended) return;
       hideTyping();
       if (m.sender === 'agent') {
         var isViewing = isConversationVisible();
@@ -874,8 +900,25 @@
       }
     });
 
-    function send(type, content, fileName, fileSize) {
-      socket.emit('visitor_message', { type: type, content: content, fileName: fileName, fileSize: fileSize });
+    function send(type, content, fileName, fileSize, onFailure) {
+      var random = window.crypto && typeof window.crypto.randomUUID === 'function'
+        ? window.crypto.randomUUID()
+        : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+      var payload = {
+        type: type, content: content, fileName: fileName, fileSize: fileSize,
+        clientMessageId: 'visitor-' + random
+      };
+      function attemptSend(attempt) {
+        socket.timeout(10000).emit('visitor_message', payload, function (timeoutError, response) {
+          if (!timeoutError && response && response.ok) return;
+          if (attempt < 2) {
+            setTimeout(function () { attemptSend(attempt + 1); }, 450 + attempt * 700);
+            return;
+          }
+          if (onFailure) onFailure(response && response.error ? response.error : '消息发送失败，请检查网络后重试');
+        });
+      }
+      attemptSend(0);
       if (!gateShownThisSession && !stored.email) {
         insertGateCard(function (email) { socket.emit('visitor_info', { email: email }); });
       }
@@ -884,7 +927,10 @@
     document.getElementById('ms-send').onclick = function () {
       var v = inputEl.value.trim();
       if (!v) return;
-      send('text', v);
+      send('text', v, null, null, function (message) {
+        if (!inputEl.value.trim()) inputEl.value = v;
+        showUploadError(message);
+      });
       inputEl.value = '';
     };
     inputEl.addEventListener('keydown', function (e) {
@@ -893,36 +939,57 @@
 
     fileEl.addEventListener('change', function () {
       var f = fileEl.files[0];
-      if (!f) return;
+      if (!f || !visitorSessionReady || attachmentUploading) return;
+      if (f.size > 20 * 1024 * 1024) {
+        showUploadError('文件不能超过 20MB');
+        fileEl.value = '';
+        return;
+      }
+      attachmentUploading = true;
+      attachEl.disabled = true;
       var fd = new FormData();
       fd.append('file', f);
+      var controller = new AbortController();
+      var uploadTimeout = setTimeout(function () { controller.abort(); }, 90000);
       fetch(SERVER + '/api/upload', {
         method: 'POST',
         headers: {
           'X-Visitor-Id': stored.visitorId || '',
           'X-Visitor-Secret': stored.visitorSecret || ''
         },
-        body: fd
+        body: fd,
+        signal: controller.signal
       })
         .then(function (r) { return r.json().then(function (data) { return { ok: r.ok, data: data }; }); })
         .then(function (result) {
           if (!result.ok) {
-            var row = document.createElement('div');
-            row.className = 'ms-row';
-            var bubble = document.createElement('div');
-            bubble.className = 'ms-bubble';
-            bubble.style.color = '#E11D48';
-            bubble.textContent = result.data && result.data.error ? result.data.error : '文件发送失败';
-            row.appendChild(bubble);
-            messagesEl.appendChild(row);
-            messagesEl.scrollTop = messagesEl.scrollHeight;
+            showUploadError(result.data && result.data.error ? result.data.error : '文件发送失败');
             return;
           }
-          send(result.data.type, result.data.url, result.data.name, result.data.size);
+          send(result.data.type, result.data.url, result.data.name, result.data.size, showUploadError);
         })
-        .catch(function () {});
+        .catch(function (error) {
+          showUploadError(error && error.name === 'AbortError' ? '上传超时，请检查网络后重试' : '文件发送失败，请检查网络');
+        })
+        .finally(function () {
+          clearTimeout(uploadTimeout);
+          attachmentUploading = false;
+          attachEl.disabled = !visitorSessionReady;
+        });
       fileEl.value = '';
     });
+
+    function showUploadError(message) {
+      var row = document.createElement('div');
+      row.className = 'ms-row';
+      var bubble = document.createElement('div');
+      bubble.className = 'ms-bubble';
+      bubble.style.color = '#E11D48';
+      bubble.textContent = message;
+      row.appendChild(bubble);
+      messagesEl.appendChild(row);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
   };
   document.head.appendChild(scriptTag);
   } // end init

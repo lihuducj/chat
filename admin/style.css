@@ -230,6 +230,10 @@ html.ms-standalone #app { height: var(--ms-app-h, 100vh); }
   display: flex; align-items: center; justify-content: center;
 }
 .round-icon-btn:hover { background: var(--border); }
+.round-icon-btn:disabled { opacity: .45; cursor: default; }
+.round-icon-btn.uploading::after { content: '…'; font-size: 17px; }
+.round-icon-btn.uploading { font-size: 0; }
+.chat-load-error { margin: auto; color: var(--danger); font-size: 13px; padding: 20px; text-align: center; }
 #chat-input-wrap {
   flex: 1; min-width: 0; display: flex; align-items: flex-end; gap: 6px;
   background: var(--panel-2); border: 1px solid var(--border); border-radius: 22px; padding: 9px 10px 9px 16px;

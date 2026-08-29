@@ -62,17 +62,40 @@ struct APIClient {
         type: String,
         content: String,
         fileName: String? = nil,
-        fileSize: Int64? = nil
+        fileSize: Int64? = nil,
+        clientMessageId: String? = nil
     ) async throws -> ChatMessage {
-        var payload: [String: Any] = ["type": type, "content": content]
+        let messageId = clientMessageId ?? "ios-\(UUID().uuidString)"
+        var payload: [String: Any] = [
+            "type": type,
+            "content": content,
+            "clientMessageId": messageId
+        ]
         if let fileName { payload["fileName"] = fileName }
         if let fileSize { payload["fileSize"] = fileSize }
         let body = try JSONSerialization.data(withJSONObject: payload)
-        return try await request(
-            path: "/api/conversations/\(escaped(conversationId))/messages",
-            method: "POST",
-            body: body
-        )
+        var lastError: Error = AppClientError.invalidResponse
+        for attempt in 0..<3 {
+            do {
+                return try await request(
+                    path: "/api/conversations/\(escaped(conversationId))/messages",
+                    method: "POST",
+                    body: body,
+                    timeout: 20
+                )
+            } catch {
+                lastError = error
+                guard shouldRetry(error), attempt < 2 else { break }
+                try? await Task.sleep(nanoseconds: UInt64(350 + attempt * 650) * 1_000_000)
+            }
+        }
+
+        // POST可能已经落库，只是成功回包在弱网中丢失。按幂等ID回查后再决定是否提示失败。
+        if let recoveredMessages = try? await messages(conversationId: conversationId),
+           let recovered = recoveredMessages.first(where: { $0.id == messageId }) {
+            return recovered
+        }
+        throw lastError
     }
 
     func recall(conversationId: String, messageId: String) async throws {
@@ -319,6 +342,19 @@ struct APIClient {
         value.replacingOccurrences(of: "\"", with: "_")
             .replacingOccurrences(of: "\r", with: "_")
             .replacingOccurrences(of: "\n", with: "_")
+    }
+
+    private func shouldRetry(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return [
+                .timedOut, .networkConnectionLost, .notConnectedToInternet,
+                .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed
+            ].contains(urlError.code)
+        }
+        if case let AppClientError.server(status, _) = error {
+            return status >= 500
+        }
+        return false
     }
 }
 
