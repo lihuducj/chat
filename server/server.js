@@ -165,6 +165,13 @@ function cleanText(value, maxLength) {
   return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
 }
 
+function socketClientIP(socket) {
+  const headers = socket.handshake.headers || {};
+  const forwarded = cleanText(headers['x-forwarded-for'], 500).split(',')[0].trim();
+  const realIP = cleanText(headers['x-real-ip'], 100);
+  return cleanText(forwarded || realIP || socket.handshake.address || '', 100);
+}
+
 function isSafeId(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(value);
 }
@@ -594,7 +601,7 @@ app.get('/api/conversations', requireAuth, (req, res) => {
   const like = `%${q}%`;
   const rows = q
     ? db.prepare(`
-        SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.last_url,
+        SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.ip as visitor_ip, v.last_url,
           (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
           (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_type
         FROM conversations c
@@ -604,7 +611,7 @@ app.get('/api/conversations', requireAuth, (req, res) => {
         ORDER BY c.last_message_at DESC
       `).all({ like })
     : db.prepare(`
-        SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.last_url,
+        SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.ip as visitor_ip, v.last_url,
           (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
           (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_type
         FROM conversations c
@@ -660,7 +667,7 @@ app.delete('/api/conversations/:id', requireAuth, (req, res) => {
 
 app.get('/api/conversations/:id', requireAuth, (req, res) => {
   const row = db.prepare(`
-    SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.last_url,
+    SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.ip as visitor_ip, v.last_url,
       (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
       (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_type
     FROM conversations c
@@ -1020,6 +1027,7 @@ io.on('connection', (socket) => {
       vSecret = nanoid(40);
     }
 
+    const visitorIP = socketClientIP(socket) || (existingVisitor && existingVisitor.ip) || '';
     if (!existingVisitor) {
       db.prepare(`INSERT INTO visitors (id, visitor_secret, name, email, ip, user_agent, first_seen, last_seen, last_url)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -1027,14 +1035,15 @@ io.on('connection', (socket) => {
         vSecret,
         cleanText(name, 80) || genVisitorLabel(),
         cleanText(email, 254),
-        cleanText(socket.handshake.address, 100),
+        visitorIP,
         cleanText(socket.handshake.headers['user-agent'] || '', 500),
         now,
         now,
         cleanText(url, 2000)
       );
     } else {
-      db.prepare('UPDATE visitors SET last_seen = ?, last_url = ? WHERE id = ?').run(now, cleanText(url, 2000), vId);
+      db.prepare('UPDATE visitors SET last_seen = ?, last_url = ?, ip = ? WHERE id = ?')
+        .run(now, cleanText(url, 2000), visitorIP, vId);
       if (email && !existingVisitor.email) {
         db.prepare('UPDATE visitors SET email = ? WHERE id = ?').run(cleanText(email, 254), vId);
       }

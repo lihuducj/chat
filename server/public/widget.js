@@ -178,6 +178,14 @@
       word-break: break-word; white-space: pre-wrap; }
     .ms-row:not(.me) .ms-bubble { background: var(--ms-bubble-bg); border: 1px solid var(--ms-bubble-border); color: var(--ms-text); border-bottom-left-radius: 4px; }
     .ms-row.me .ms-bubble { background: ${PRIMARY}; color: #fff; border-bottom-right-radius: 4px; }
+    .ms-quote-block { margin: -3px -6px 9px; padding: 8px 10px; border-left: 4px solid ${PRIMARY};
+      border-radius: 8px; background: var(--ms-bubble-bg); background: color-mix(in srgb, ${PRIMARY} 12%, var(--ms-bubble-bg)); white-space: normal; }
+    .ms-quote-label { margin-bottom: 3px; color: ${PRIMARY}; font-size: 11px; font-weight: 800; }
+    .ms-quote-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden;
+      font-size: 13px; line-height: 1.42; opacity: .88; white-space: pre-wrap; }
+    .ms-row.me .ms-quote-block { border-left-color: #fff; background: rgba(255,255,255,.17); }
+    .ms-row.me .ms-quote-label { color: #fff; }
+    .ms-text-body { white-space: pre-wrap; }
     .ms-bubble img { max-width: 100%; border-radius: 8px; display: block; }
     .ms-bubble a.ms-file { color: inherit; text-decoration: underline; }
     .ms-time { font-size: 10px; color: var(--ms-muted); margin-top: 3px; padding: 0 4px; }
@@ -646,6 +654,27 @@
     menuViewEl.classList.remove('show');
   }
 
+  function parseQuotedMessage(text) {
+    if (typeof text !== 'string' || text.charAt(0) !== '「') return null;
+    var quoteEnd = text.lastIndexOf('」\n');
+    if (quoteEnd <= 1 || quoteEnd + 2 >= text.length) return null;
+    return { quote: text.slice(1, quoteEnd), body: text.slice(quoteEnd + 2) };
+  }
+
+  function renderMessageText(container, text) {
+    var parts = parseQuotedMessage(text);
+    if (parts) {
+      var quote = document.createElement('div');
+      quote.className = 'ms-quote-block';
+      quote.innerHTML = '<div class="ms-quote-label">↩ 引用消息</div><div class="ms-quote-text">' + linkify(parts.quote) + '</div>';
+      container.appendChild(quote);
+    }
+    var body = document.createElement('div');
+    body.className = 'ms-text-body';
+    body.innerHTML = linkify(parts ? parts.body : text);
+    container.appendChild(body);
+  }
+
   function renderMessage(m) {
     var row = document.createElement('div');
     row.className = 'ms-row' + (m.sender === 'visitor' ? ' me' : '');
@@ -667,7 +696,7 @@
       a.textContent = '📎 ' + (m.file_name || '文件');
       bubble.appendChild(a);
     } else {
-      bubble.innerHTML = linkify(m.content);
+      renderMessageText(bubble, m.content);
     }
     col.appendChild(bubble);
     var timeEl = document.createElement('div');

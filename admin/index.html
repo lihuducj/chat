@@ -20,7 +20,7 @@
     html, body { background: #000000 !important; }
   }
 </style>
-<link rel="stylesheet" href="style.css?v=20260821-1" />
+<link rel="stylesheet" href="style.css?v=20260829-1" />
 </head>
 <body>
   <div id="app">
@@ -56,6 +56,7 @@
           <div id="typing-indicator">对方正在输入…</div>
           <div id="meta-panel" style="display:none">
             <button id="meta-email-copy" type="button" title="复制客户邮箱"></button>
+            <button id="meta-ip-copy" type="button" title="复制访客 IP"></button>
             <div id="tag-chips"></div>
             <input id="tag-input" placeholder="输入标签后回车添加" />
             <textarea id="notes-input" placeholder="内部备注（仅自己可见）" rows="2"></textarea>
@@ -177,6 +178,6 @@
   <div id="copy-toast" role="status" aria-live="polite">已复制</div>
 
   <script src="/socket.io/socket.io.js"></script>
-  <script src="app.js?v=20260821-1"></script>
+  <script src="app.js?v=20260829-1"></script>
 </body>
 </html>

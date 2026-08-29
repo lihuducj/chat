@@ -53,6 +53,7 @@ const chatMessages = document.getElementById('chat-messages');
 const chatInput = document.getElementById('chat-input');
 const visitorNameEl = document.getElementById('chat-visitor-name');
 const metaEmailCopyEl = document.getElementById('meta-email-copy');
+const metaIPCopyEl = document.getElementById('meta-ip-copy');
 document.getElementById('chat-visitor-url').onclick = function () { this.classList.toggle('expanded'); };
 const connDot = document.getElementById('conn-dot');
 const origTitle = document.title;
@@ -93,6 +94,10 @@ visitorNameEl.onclick = function () {
 metaEmailCopyEl.onclick = function () {
   const email = this.dataset.email || '';
   if (email) copyText(email, '邮箱已复制');
+};
+metaIPCopyEl.onclick = function () {
+  const ip = this.dataset.ip || '';
+  if (ip) copyText(ip, 'IP 已复制');
 };
 
 // ---------- 声音提醒 ----------
@@ -324,6 +329,9 @@ async function openConversation(c) {
   metaEmailCopyEl.dataset.email = c.visitor_email || '';
   metaEmailCopyEl.textContent = c.visitor_email ? '邮箱：' + c.visitor_email + '　📋' : '';
   metaEmailCopyEl.style.display = c.visitor_email ? 'block' : 'none';
+  metaIPCopyEl.dataset.ip = c.visitor_ip || '';
+  metaIPCopyEl.textContent = c.visitor_ip ? '最近 IP：' + c.visitor_ip + '　📋' : '';
+  metaIPCopyEl.style.display = c.visitor_ip ? 'block' : 'none';
   document.getElementById('chat-visitor-url').textContent = c.last_url || '';
   document.getElementById('chat-visitor-url').title = c.last_url || '';
   document.getElementById('chat-visitor-url').classList.remove('expanded'); // 每次切换会话都收起来，别带着上一个会话的展开状态
@@ -812,6 +820,27 @@ function linkify(text) {
   });
 }
 
+function parseQuotedMessage(text) {
+  if (typeof text !== 'string' || text.charAt(0) !== '「') return null;
+  const quoteEnd = text.lastIndexOf('」\n');
+  if (quoteEnd <= 1 || quoteEnd + 2 >= text.length) return null;
+  return { quote: text.slice(1, quoteEnd), body: text.slice(quoteEnd + 2) };
+}
+
+function renderMessageText(container, text, preview) {
+  const parts = parseQuotedMessage(text);
+  if (parts) {
+    const quote = document.createElement('div');
+    quote.className = 'msg-quote-block';
+    quote.innerHTML = '<div class="msg-quote-label">↩ 引用消息</div><div class="msg-quote-text">' + linkify(parts.quote) + '</div>';
+    container.appendChild(quote);
+  }
+  const body = document.createElement('div');
+  body.className = preview ? 'long-message-preview' : 'msg-text-body';
+  body.innerHTML = linkify(parts ? parts.body : text);
+  container.appendChild(body);
+}
+
 function fmtMsgTime(ts) {
   if (!ts) return '';
   const d = new Date(ts);
@@ -995,7 +1024,8 @@ function openFullMessage(m) {
   }
 
   const content = overlay.querySelector('.full-message-content');
-  content.innerHTML = linkify(m.content);
+  content.innerHTML = '';
+  renderMessageText(content, m.content, false);
   const meta = overlay.querySelector('.full-message-meta');
   meta.textContent = fmtMessageDay(m.created_at) + ' ' + fmtMsgTime(m.created_at);
   const actions = overlay.querySelector('.full-message-actions');
@@ -1063,8 +1093,8 @@ function appendMessage(m, options) {
   } else if (isLongTextMessage(m)) {
     bubble.classList.add('long-text-bubble');
     const preview = document.createElement('div');
-    preview.className = 'long-message-preview';
-    preview.textContent = m.content;
+    preview.className = 'long-message-content';
+    renderMessageText(preview, m.content, true);
     const openButton = document.createElement('button');
     openButton.type = 'button';
     openButton.className = 'long-message-open';
@@ -1086,7 +1116,7 @@ function appendMessage(m, options) {
       }
     };
   } else {
-    bubble.innerHTML = linkify(m.content);
+    renderMessageText(bubble, m.content, false);
   }
   col.appendChild(bubble);
 

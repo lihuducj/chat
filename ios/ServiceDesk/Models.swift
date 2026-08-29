@@ -22,6 +22,7 @@ struct Conversation: Identifiable, Codable, Hashable {
     let visitorReadAt: Int64?
     let visitorName: String?
     let visitorEmail: String?
+    let visitorIP: String?
     let lastUrl: String?
     let lastMessage: String?
     let lastType: String?
@@ -36,6 +37,7 @@ struct Conversation: Identifiable, Codable, Hashable {
         case visitorReadAt = "visitor_read_at"
         case visitorName = "visitor_name"
         case visitorEmail = "visitor_email"
+        case visitorIP = "visitor_ip"
         case lastUrl = "last_url"
         case lastMessage = "last_message"
         case lastType = "last_type"
@@ -71,6 +73,7 @@ extension Conversation {
         visitorReadAt = try values.decodeIfPresent(Int64.self, forKey: .visitorReadAt)
         visitorName = try values.decodeIfPresent(String.self, forKey: .visitorName)
         visitorEmail = try values.decodeIfPresent(String.self, forKey: .visitorEmail)
+        visitorIP = try values.decodeIfPresent(String.self, forKey: .visitorIP)
         lastUrl = try values.decodeIfPresent(String.self, forKey: .lastUrl)
         lastMessage = try values.decodeIfPresent(String.self, forKey: .lastMessage)
         lastType = try values.decodeIfPresent(String.self, forKey: .lastType)

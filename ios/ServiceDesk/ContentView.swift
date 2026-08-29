@@ -493,6 +493,28 @@ private enum ComposerPanel: Equatable {
     case tools
 }
 
+private struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> EnablerViewController {
+        EnablerViewController()
+    }
+
+    func updateUIViewController(_ uiViewController: EnablerViewController, context: Context) {
+        uiViewController.enableInteractivePop()
+    }
+
+    final class EnablerViewController: UIViewController {
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            enableInteractivePop()
+        }
+
+        func enableInteractivePop() {
+            navigationController?.interactivePopGestureRecognizer?.delegate = nil
+            navigationController?.interactivePopGestureRecognizer?.isEnabled = true
+        }
+    }
+}
+
 private struct ChatView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -518,6 +540,8 @@ private struct ChatView: View {
     @State private var previewImageURL: URL?
     @State private var typingTask: Task<Void, Never>?
     @State private var typingHideTask: Task<Void, Never>?
+    @State private var unreadRefreshTask: Task<Void, Never>?
+    @State private var otherUnreadCount = 0
     @State private var messageLoadSequence = 0
     @State private var isReviewingMessageHistory = false
     @FocusState private var composerFocused: Bool
@@ -709,6 +733,8 @@ private struct ChatView: View {
         .animation(.easeInOut(duration: 0.2), value: composerPanel)
         .navigationTitle(liveConversation.displayName)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(true)
+        .background(InteractivePopGestureEnabler().frame(width: 0, height: 0))
         .overlay(alignment: .top) {
             if let copyConfirmation {
                 Label(copyConfirmation, systemImage: "checkmark.circle.fill")
@@ -722,6 +748,24 @@ private struct ChatView: View {
             }
         }
         .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button { dismiss() } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 17, weight: .semibold))
+                        if otherUnreadCount > 0 {
+                            Text(otherUnreadCount > 99 ? "99+" : "\(otherUnreadCount)")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .frame(minWidth: 20, minHeight: 20)
+                                .background(Color.red, in: Capsule())
+                                .accessibilityLabel("其他会话有 \(otherUnreadCount) 条未读消息")
+                        }
+                    }
+                }
+                .accessibilityLabel(otherUnreadCount > 0 ? "返回，其他会话有 \(otherUnreadCount) 条未读消息" : "返回")
+            }
             ToolbarItem(placement: .principal) {
                 if let email = liveConversation.visitorEmail, !email.isEmpty {
                     Button { copyEmail(email) } label: {
@@ -826,6 +870,7 @@ private struct ChatView: View {
             typingTask?.cancel()
             typingTask = nil
             typingHideTask?.cancel()
+            unreadRefreshTask?.cancel()
         }
         .onAppear {
             if draft.isEmpty {
@@ -834,11 +879,13 @@ private struct ChatView: View {
         }
         .task {
             await loadMessages()
+            await refreshOtherUnreadCount()
             while !Task.isCancelled {
                 let delay: UInt64 = appState.isRealtimeConnected ? 60_000_000_000 : 8_000_000_000
                 try? await Task.sleep(nanoseconds: delay)
                 guard !Task.isCancelled else { break }
                 await loadMessages(showError: false)
+                await refreshOtherUnreadCount()
             }
         }
     }
@@ -1071,6 +1118,9 @@ private struct ChatView: View {
     }
 
     private func handleRealtimeEvent(_ event: NativeEvent) {
+        if ["new_message", "conversation_updated", "conversation_deleted"].contains(event.type) {
+            scheduleOtherUnreadRefresh()
+        }
         guard event.conversationId == conversation.id else { return }
         switch event.type {
         case "visitor_typing":
@@ -1120,6 +1170,23 @@ private struct ChatView: View {
         default:
             break
         }
+    }
+
+    private func scheduleOtherUnreadRefresh() {
+        unreadRefreshTask?.cancel()
+        unreadRefreshTask = Task {
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled else { return }
+            await refreshOtherUnreadCount()
+        }
+    }
+
+    private func refreshOtherUnreadCount() async {
+        guard let client = appState.client,
+              let allConversations = try? await client.conversations() else { return }
+        otherUnreadCount = allConversations
+            .filter { $0.id != conversation.id }
+            .reduce(0) { $0 + max(0, $1.unreadCount) }
     }
 
     private func receiptState(for message: ChatMessage) -> MessageReceipt? {
@@ -1368,6 +1435,87 @@ private struct ChatDateSeparator: View {
     }
 }
 
+private struct QuotedMessageParts {
+    let quote: String
+    let body: String
+
+    static func parse(_ content: String) -> QuotedMessageParts? {
+        guard content.first == "「",
+              let delimiter = content.range(of: "」\n", options: .backwards),
+              delimiter.lowerBound > content.startIndex,
+              delimiter.upperBound < content.endIndex else { return nil }
+        let quoteStart = content.index(after: content.startIndex)
+        return QuotedMessageParts(
+            quote: String(content[quoteStart..<delimiter.lowerBound]),
+            body: String(content[delimiter.upperBound...])
+        )
+    }
+}
+
+private struct QuotedMessageBlock: View {
+    let text: String
+    let isAgentMessage: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(isAgentMessage ? Color.white : Color.blue)
+                .frame(width: 4)
+            VStack(alignment: .leading, spacing: 3) {
+                Label("引用消息", systemImage: "arrowshape.turn.up.left.fill")
+                    .font(.caption2.bold())
+                    .foregroundStyle(isAgentMessage ? Color.white : Color.blue)
+                Text(text)
+                    .font(.caption)
+                    .foregroundStyle(isAgentMessage ? Color.white.opacity(0.9) : Color.primary.opacity(0.82))
+                    .lineLimit(4)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(8)
+        .background(
+            isAgentMessage ? Color.white.opacity(0.16) : Color.blue.opacity(0.1),
+            in: RoundedRectangle(cornerRadius: 9)
+        )
+    }
+}
+
+private struct MessageTextContent: View {
+    let content: String
+    let isAgentMessage: Bool
+    let autoTranslate: Bool
+    let isPreview: Bool
+
+    private var parts: QuotedMessageParts? { QuotedMessageParts.parse(content) }
+    private var bodyText: String { parts?.body ?? content }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: parts == nil ? 0 : 8) {
+            if let parts {
+                QuotedMessageBlock(text: parts.quote, isAgentMessage: isAgentMessage)
+            }
+            if isPreview {
+                Text(bodyText)
+                    .font(.body)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                #if canImport(Translation)
+                if #available(iOS 18.0, *), autoTranslate {
+                    AutoTranslatedMessageText(text: bodyText, isAgentMessage: isAgentMessage)
+                } else {
+                    LinkifiedSelectableText(text: bodyText, isAgentMessage: isAgentMessage)
+                }
+                #else
+                LinkifiedSelectableText(text: bodyText, isAgentMessage: isAgentMessage)
+                #endif
+            }
+        }
+    }
+}
+
 private struct MessageBubble: View {
     let message: ChatMessage
     let client: APIClient?
@@ -1418,11 +1566,12 @@ private struct MessageBubble: View {
                             showFullText = true
                         } label: {
                             VStack(alignment: .leading, spacing: 7) {
-                                Text(message.content)
-                                    .font(.body)
-                                    .multilineTextAlignment(.leading)
-                                    .lineLimit(8)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                MessageTextContent(
+                                    content: message.content,
+                                    isAgentMessage: message.isAgent,
+                                    autoTranslate: false,
+                                    isPreview: true
+                                )
                                 HStack(spacing: 4) {
                                     Spacer()
                                     Text("查看全文")
@@ -1435,24 +1584,12 @@ private struct MessageBubble: View {
                         .buttonStyle(.plain)
                         .accessibilityHint("点按查看完整消息")
                     } else {
-                        #if canImport(Translation)
-                        if #available(iOS 18.0, *), autoTranslate {
-                            AutoTranslatedMessageText(
-                                text: message.content,
-                                isAgentMessage: message.isAgent
-                            )
-                        } else {
-                            LinkifiedSelectableText(
-                                text: message.content,
-                                isAgentMessage: message.isAgent
-                            )
-                        }
-                        #else
-                        LinkifiedSelectableText(
-                            text: message.content,
-                            isAgentMessage: message.isAgent
+                        MessageTextContent(
+                            content: message.content,
+                            isAgentMessage: message.isAgent,
+                            autoTranslate: autoTranslate,
+                            isPreview: false
                         )
-                        #endif
                     }
                 }
                 .padding(message.type == "image" && !message.isRecalled ? 0 : 10)
@@ -1521,9 +1658,11 @@ private struct ExpandedMessageTextView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                LinkifiedSelectableText(
-                    text: message.content,
-                    isAgentMessage: false
+                MessageTextContent(
+                    content: message.content,
+                    isAgentMessage: false,
+                    autoTranslate: false,
+                    isPreview: false
                 )
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -2285,7 +2424,7 @@ private struct ConversationDetailsView: View {
             Form {
                 Section("访客") {
                     if let email = conversation.visitorEmail, !email.isEmpty {
-                        Button { copyEmail(email) } label: {
+                        Button { copyValue(email, confirmation: "邮箱已复制") } label: {
                             HStack {
                                 Text("邮箱").foregroundStyle(.primary)
                                 Spacer()
@@ -2297,6 +2436,20 @@ private struct ConversationDetailsView: View {
                         .accessibilityHint("点按复制邮箱")
                     } else {
                         LabeledContent("邮箱", value: "未填写")
+                    }
+                    if let ip = conversation.visitorIP, !ip.isEmpty {
+                        Button { copyValue(ip, confirmation: "IP 已复制") } label: {
+                            HStack {
+                                Text("最近 IP").foregroundStyle(.primary)
+                                Spacer()
+                                Text(ip).foregroundStyle(.secondary).lineLimit(1)
+                                Image(systemName: "doc.on.doc").foregroundStyle(.blue)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("点按复制访客 IP")
+                    } else {
+                        LabeledContent("最近 IP", value: "暂无记录")
                     }
                     LabeledContent("称呼", value: conversation.visitorName ?? "访客")
                     if let url = conversation.lastUrl, !url.isEmpty {
@@ -2343,9 +2496,9 @@ private struct ConversationDetailsView: View {
         }
     }
 
-    private func copyEmail(_ email: String) {
-        UIPasteboard.general.string = email
-        copyMessage = "邮箱已复制"
+    private func copyValue(_ value: String, confirmation: String) {
+        UIPasteboard.general.string = value
+        copyMessage = confirmation
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             copyMessage = nil
