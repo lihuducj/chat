@@ -493,28 +493,6 @@ private enum ComposerPanel: Equatable {
     case tools
 }
 
-private struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
-    func makeUIViewController(context: Context) -> EnablerViewController {
-        EnablerViewController()
-    }
-
-    func updateUIViewController(_ uiViewController: EnablerViewController, context: Context) {
-        uiViewController.enableInteractivePop()
-    }
-
-    final class EnablerViewController: UIViewController {
-        override func viewDidAppear(_ animated: Bool) {
-            super.viewDidAppear(animated)
-            enableInteractivePop()
-        }
-
-        func enableInteractivePop() {
-            navigationController?.interactivePopGestureRecognizer?.delegate = nil
-            navigationController?.interactivePopGestureRecognizer?.isEnabled = true
-        }
-    }
-}
-
 private struct ChatView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -733,8 +711,6 @@ private struct ChatView: View {
         .animation(.easeInOut(duration: 0.2), value: composerPanel)
         .navigationTitle(liveConversation.displayName)
         .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(true)
-        .background(InteractivePopGestureEnabler().frame(width: 0, height: 0))
         .overlay(alignment: .top) {
             if let copyConfirmation {
                 Label(copyConfirmation, systemImage: "checkmark.circle.fill")
@@ -748,23 +724,16 @@ private struct ChatView: View {
             }
         }
         .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                Button { dismiss() } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 17, weight: .semibold))
-                        if otherUnreadCount > 0 {
-                            Text(otherUnreadCount > 99 ? "99+" : "\(otherUnreadCount)")
-                                .font(.caption2.bold())
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 6)
-                                .frame(minWidth: 20, minHeight: 20)
-                                .background(Color.red, in: Capsule())
-                                .accessibilityLabel("其他会话有 \(otherUnreadCount) 条未读消息")
-                        }
-                    }
+            if otherUnreadCount > 0 {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Text(otherUnreadCount > 99 ? "99+" : "\(otherUnreadCount)")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .frame(minWidth: 20, minHeight: 20)
+                        .background(Color.red, in: Capsule())
+                        .accessibilityLabel("其他会话有 \(otherUnreadCount) 条未读消息")
                 }
-                .accessibilityLabel(otherUnreadCount > 0 ? "返回，其他会话有 \(otherUnreadCount) 条未读消息" : "返回")
             }
             ToolbarItem(placement: .principal) {
                 if let email = liveConversation.visitorEmail, !email.isEmpty {
