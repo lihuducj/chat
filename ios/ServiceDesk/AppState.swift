@@ -21,6 +21,9 @@ final class AppState: ObservableObject {
     private var eventTask: Task<Void, Never>?
     private var presenceTask: Task<Void, Never>?
     private var appIsForeground = false
+    private var lastNativeEventID: Int64?
+    private var notifiedMessageKeys = Set<String>()
+    private var notifiedMessageKeyOrder: [String] = []
 
     init() {
         foregroundSoundEnabled = UserDefaults.standard.object(forKey: foregroundSoundKey) as? Bool ?? true
@@ -133,6 +136,9 @@ final class AppState: ObservableObject {
 
         guard let client, token != nil else { return }
         if isForeground {
+            // iOS 从后台恢复时原来的 HTTP 长连接可能看似存活、实际已经不再收数据。
+            // 每次回到前台主动重建，并通过 lastNativeEventID 补收断线期间的事件。
+            startEventStream()
             presenceTask = Task {
                 while !Task.isCancelled {
                     try? await client.reportNativePresence(active: isRealtimeConnected)
@@ -140,6 +146,9 @@ final class AppState: ObservableObject {
                 }
             }
         } else {
+            eventTask?.cancel()
+            eventTask = nil
+            isRealtimeConnected = false
             Task { try? await client.reportNativePresence(active: false) }
         }
     }
@@ -160,13 +169,21 @@ final class AppState: ObservableObject {
     private func startEventStream() {
         eventTask?.cancel()
         guard let client, token != nil else { return }
+        isRealtimeConnected = false
 
         eventTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
-                    for try await event in client.eventStream() {
+                    for try await event in client.eventStream(after: lastNativeEventID) {
                         guard let self, !Task.isCancelled else { return }
-                        if event.type == "connected" {
+                        if let eventID = event.eventId {
+                            if event.type == "connected" {
+                                lastNativeEventID = eventID
+                            } else if eventID > (lastNativeEventID ?? 0) {
+                                lastNativeEventID = eventID
+                            }
+                        }
+                        if event.type == "connected" || event.type == "heartbeat" {
                             isRealtimeConnected = true
                             sessionMessage = nil
                             if appIsForeground {
@@ -176,11 +193,9 @@ final class AppState: ObservableObject {
                             lastEvent = event
                             if appIsForeground,
                                event.type == "new_message",
-                               event.message?.sender == "visitor" {
-                                if foregroundSoundEnabled {
-                                    AudioServicesPlaySystemSound(1007)
-                                }
-                                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                               let message = event.message,
+                               message.sender == "visitor" {
+                                notifyForegroundVisitorMessage(message)
                             }
                         }
                     }
@@ -208,8 +223,55 @@ final class AppState: ObservableObject {
         presenceTask = nil
         isRealtimeConnected = false
         lastEvent = nil
+        lastNativeEventID = nil
+        notifiedMessageKeys.removeAll()
+        notifiedMessageKeyOrder.removeAll()
         token = nil
         KeychainStore.deleteToken()
+    }
+
+    func notifyForegroundVisitorMessage(_ message: ChatMessage) {
+        notifyForegroundVisitorMessage(
+            conversationID: message.conversationId,
+            messageID: message.id,
+            createdAt: message.createdAt
+        )
+    }
+
+    func notifyForegroundConversationChange(_ conversation: Conversation) {
+        guard conversation.unreadCount > 0, conversation.lastSender == "visitor" else { return }
+        notifyForegroundVisitorMessage(
+            conversationID: conversation.id,
+            messageID: nil,
+            createdAt: conversation.lastMessageAt
+        )
+    }
+
+    private func notifyForegroundVisitorMessage(
+        conversationID: String,
+        messageID: String?,
+        createdAt: Int64
+    ) {
+        guard appIsForeground else { return }
+        let timeKey = "conversation:\(conversationID):\(createdAt)"
+        let idKey = messageID.map { "message:\($0)" }
+        if notifiedMessageKeys.contains(timeKey) || idKey.map(notifiedMessageKeys.contains) == true {
+            return
+        }
+        rememberNotificationKey(timeKey)
+        if let idKey { rememberNotificationKey(idKey) }
+        if foregroundSoundEnabled {
+            AudioServicesPlaySystemSound(1007)
+        }
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+
+    private func rememberNotificationKey(_ key: String) {
+        guard notifiedMessageKeys.insert(key).inserted else { return }
+        notifiedMessageKeyOrder.append(key)
+        while notifiedMessageKeyOrder.count > 300 {
+            notifiedMessageKeys.remove(notifiedMessageKeyOrder.removeFirst())
+        }
     }
 
     static func normalizeServer(_ input: String) throws -> URL {

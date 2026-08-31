@@ -26,6 +26,7 @@ struct Conversation: Identifiable, Codable, Hashable {
     let lastUrl: String?
     let lastMessage: String?
     let lastType: String?
+    let lastSender: String?
 
     enum CodingKeys: String, CodingKey {
         case id, status, notes, tags
@@ -41,6 +42,7 @@ struct Conversation: Identifiable, Codable, Hashable {
         case lastUrl = "last_url"
         case lastMessage = "last_message"
         case lastType = "last_type"
+        case lastSender = "last_sender"
     }
 
     var displayName: String {
@@ -77,6 +79,7 @@ extension Conversation {
         lastUrl = try values.decodeIfPresent(String.self, forKey: .lastUrl)
         lastMessage = try values.decodeIfPresent(String.self, forKey: .lastMessage)
         lastType = try values.decodeIfPresent(String.self, forKey: .lastType)
+        lastSender = try values.decodeIfPresent(String.self, forKey: .lastSender)
     }
 }
 
@@ -124,6 +127,7 @@ struct NativeEvent: Decodable, Hashable {
     let conversationId: String?
     let messageId: String?
     let message: ChatMessage?
+    let eventId: Int64?
 }
 
 struct UploadResponse: Decodable {

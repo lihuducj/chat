@@ -207,6 +207,9 @@ function requireUploadIdentity(req, res, next) {
 // 使用系统自带的 HTTP 长连接，不要求 iOS App 集成第三方 Socket.IO SDK。
 // Nginx 反代时 X-Accel-Buffering=no 可以避免事件被缓存，消息会立即到达手机。
 const nativeEventClients = new Set();
+const nativeEventHistory = [];
+const NATIVE_EVENT_HISTORY_LIMIT = 300;
+let nativeEventSequence = Date.now() * 1000;
 let nativeForegroundSeenAt = 0;
 const NATIVE_FOREGROUND_TTL_MS = 15 * 1000;
 
@@ -219,7 +222,16 @@ app.get('/api/native/health', (req, res) => {
 });
 
 function emitNativeEvent(type, conversationId, extra = {}) {
-  const payload = JSON.stringify({ type, conversationId: conversationId || null, ...extra });
+  nativeEventSequence += 1;
+  const event = {
+    type,
+    conversationId: conversationId || null,
+    eventId: nativeEventSequence,
+    ...extra
+  };
+  const payload = JSON.stringify(event);
+  nativeEventHistory.push({ id: nativeEventSequence, payload });
+  if (nativeEventHistory.length > NATIVE_EVENT_HISTORY_LIMIT) nativeEventHistory.shift();
   for (const client of nativeEventClients) {
     try {
       client.write(`data: ${payload}\n\n`);
@@ -236,11 +248,27 @@ app.get('/api/native/events', requireAuth, (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
   nativeEventClients.add(res);
-  res.write(`data: ${JSON.stringify({ type: 'connected', conversationId: null })}\n\n`);
+
+  // App 切后台、换网络或 iOS 暂停进程时可能丢掉短时 SSE 事件。
+  // 重连时按上次 eventId 补发最近事件，不用等待长轮询才看到新消息。
+  const requestedSince = Number(req.query.since || req.get('last-event-id') || 0);
+  const since = Number.isSafeInteger(requestedSince) && requestedSince > 0 ? requestedSince : 0;
+  if (since > 0) {
+    for (const event of nativeEventHistory) {
+      if (event.id > since) res.write(`data: ${event.payload}\n\n`);
+    }
+  }
+  // 首次连接只建立当前游标，不把服务器启动后的旧事件当成新消息。
+  // connected 放在补发之后，如果补发中途断线，App 仍会从最后实际收到的 eventId 继续。
+  res.write(`data: ${JSON.stringify({
+    type: 'connected',
+    conversationId: null,
+    eventId: nativeEventSequence
+  })}\n\n`);
 
   const heartbeat = setInterval(() => {
-    try { res.write(': ping\n\n'); } catch (e) {}
-  }, 25000);
+    try { res.write(`data: ${JSON.stringify({ type: 'heartbeat', conversationId: null })}\n\n`); } catch (e) {}
+  }, 15000);
 
   req.on('close', () => {
     clearInterval(heartbeat);
@@ -622,8 +650,9 @@ app.get('/api/conversations', requireAuth, (req, res) => {
   const rows = q
     ? db.prepare(`
         SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.ip as visitor_ip, v.last_url,
-          (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
-          (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_type
+          (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_message,
+          (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_type,
+          (SELECT sender FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_sender
         FROM conversations c
         JOIN visitors v ON v.id = c.visitor_id
         WHERE v.name LIKE @like OR v.email LIKE @like OR c.tags LIKE @like OR c.notes LIKE @like
@@ -632,8 +661,9 @@ app.get('/api/conversations', requireAuth, (req, res) => {
       `).all({ like })
     : db.prepare(`
         SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.ip as visitor_ip, v.last_url,
-          (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
-          (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_type
+          (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_message,
+          (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_type,
+          (SELECT sender FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_sender
         FROM conversations c
         JOIN visitors v ON v.id = c.visitor_id
         ORDER BY c.last_message_at DESC
@@ -688,8 +718,9 @@ app.delete('/api/conversations/:id', requireAuth, (req, res) => {
 app.get('/api/conversations/:id', requireAuth, (req, res) => {
   const row = db.prepare(`
     SELECT c.*, v.name as visitor_name, v.email as visitor_email, v.ip as visitor_ip, v.last_url,
-      (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
-      (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) as last_type
+      (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_message,
+      (SELECT type FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_type,
+      (SELECT sender FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1) as last_sender
     FROM conversations c
     JOIN visitors v ON v.id = c.visitor_id
     WHERE c.id = ?

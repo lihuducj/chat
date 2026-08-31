@@ -231,17 +231,21 @@ struct APIClient {
         return URL(string: path, relativeTo: baseURL)?.absoluteURL
     }
 
-    func eventStream() -> AsyncThrowingStream<NativeEvent, Error> {
+    func eventStream(after eventId: Int64? = nil) -> AsyncThrowingStream<NativeEvent, Error> {
         AsyncThrowingStream { continuation in
             let streamTask = Task {
                 do {
-                    guard let url = makeURL(path: "/api/native/events") else {
+                    let queryItems = eventId.map { [URLQueryItem(name: "since", value: String($0))] } ?? []
+                    guard let url = makeURL(path: "/api/native/events", queryItems: queryItems) else {
                         throw AppClientError.invalidServer
                     }
                     var request = URLRequest(url: url, timeoutInterval: 90)
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     if let token, !token.isEmpty {
                         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    }
+                    if let eventId {
+                        request.setValue(String(eventId), forHTTPHeaderField: "Last-Event-ID")
                     }
 
                     let (bytes, response) = try await Self.session.bytes(for: request)

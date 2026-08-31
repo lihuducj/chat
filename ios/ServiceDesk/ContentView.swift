@@ -193,6 +193,8 @@ private struct ConversationListView: View {
     @State private var eventRefreshTask: Task<Void, Never>?
     @State private var loadSequence = 0
     @State private var navigationPath: [Conversation] = []
+    @State private var hasLoadedConversationBaseline = false
+    @State private var seenConversationActivity: [String: Int64] = [:]
 
     private var displayedConversations: [Conversation] {
         conversations
@@ -323,7 +325,8 @@ private struct ConversationListView: View {
                 guard !Task.isCancelled else { return }
                 await load(showSpinner: conversations.isEmpty)
                 while !Task.isCancelled {
-                    let delay: UInt64 = appState.isRealtimeConnected ? 60_000_000_000 : 8_000_000_000
+                    // SSE 是主通道；4秒轮询只做轻量对账，防止 iOS/反向代理偶发吞掉长连接事件。
+                    let delay: UInt64 = appState.isRealtimeConnected ? 4_000_000_000 : 3_000_000_000
                     try? await Task.sleep(nanoseconds: delay)
                     guard !Task.isCancelled else { break }
                     await load(showSpinner: false)
@@ -361,6 +364,23 @@ private struct ConversationListView: View {
         do {
             let result = try await client.conversations(search: query)
             guard sequence == loadSequence else { return }
+            if query.isEmpty {
+                if hasLoadedConversationBaseline {
+                    for conversation in result where conversation.unreadCount > 0 {
+                        if let previousActivity = seenConversationActivity[conversation.id] {
+                            if conversation.lastMessageAt > previousActivity {
+                                appState.notifyForegroundConversationChange(conversation)
+                            }
+                        } else {
+                            appState.notifyForegroundConversationChange(conversation)
+                        }
+                    }
+                }
+                seenConversationActivity = Dictionary(
+                    uniqueKeysWithValues: result.map { ($0.id, $0.lastMessageAt) }
+                )
+                hasLoadedConversationBaseline = true
+            }
             conversations = result
             if query.isEmpty {
                 syncAppBadge(result.reduce(0) { $0 + $1.unreadCount })
@@ -522,6 +542,7 @@ private struct ChatView: View {
     @State private var otherUnreadCount = 0
     @State private var messageLoadSequence = 0
     @State private var isReviewingMessageHistory = false
+    @State private var hasLoadedInitialMessages = false
     @FocusState private var composerFocused: Bool
 
     private let chatBottomID = "chat-bottom-anchor"
@@ -852,7 +873,7 @@ private struct ChatView: View {
             await loadMessages()
             await refreshOtherUnreadCount()
             while !Task.isCancelled {
-                let delay: UInt64 = appState.isRealtimeConnected ? 60_000_000_000 : 8_000_000_000
+                let delay: UInt64 = appState.isRealtimeConnected ? 5_000_000_000 : 3_000_000_000
                 try? await Task.sleep(nanoseconds: delay)
                 guard !Task.isCancelled else { break }
                 await loadMessages(showError: false)
@@ -903,6 +924,10 @@ private struct ChatView: View {
         do {
             let serverMessages = try await client.messages(conversationId: conversation.id)
             guard sequence == messageLoadSequence else { return }
+            let knownMessageIDs = Set(messages.lazy.filter { !$0.isPending }.map(\.id))
+            let newlyDiscoveredVisitorMessages = hasLoadedInitialMessages
+                ? serverMessages.filter { $0.sender == "visitor" && !knownMessageIDs.contains($0.id) }
+                : []
             var pending = messages.filter(\.isPending)
             for serverMessage in serverMessages where serverMessage.isAgent {
                 if let index = pending.firstIndex(where: {
@@ -912,6 +937,8 @@ private struct ChatView: View {
                 }
             }
             messages = deduplicatedMessages(serverMessages + pending)
+            hasLoadedInitialMessages = true
+            newlyDiscoveredVisitorMessages.forEach(appState.notifyForegroundVisitorMessage)
             liveConversation = try await client.conversation(id: conversation.id)
             try? await client.markRead(conversationId: conversation.id)
             if showError { errorMessage = nil }
