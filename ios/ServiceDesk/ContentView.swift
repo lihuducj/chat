@@ -267,6 +267,7 @@ private struct ConversationListView: View {
             .navigationTitle("客服台")
             .navigationDestination(for: Conversation.self) { conversation in
                 ChatView(conversation: conversation)
+                    .id(conversation.id)
             }
             .searchable(text: $search, prompt: "搜索邮箱、标签、备注、消息")
             .toolbar {
@@ -335,6 +336,11 @@ private struct ConversationListView: View {
             .task(id: appState.pendingConversationID) {
                 guard let conversationID = appState.pendingConversationID else { return }
                 await openConversationFromDeepLink(conversationID)
+            }
+            .onChange(of: navigationPath.count) { count in
+                // 从聊天页返回列表时立即对账，不等下一轮 4 秒轮询。
+                guard count == 0 else { return }
+                Task { await load(showSpinner: false) }
             }
         }
     }
@@ -543,6 +549,9 @@ private struct ChatView: View {
     @State private var messageLoadSequence = 0
     @State private var isReviewingMessageHistory = false
     @State private var hasLoadedInitialMessages = false
+    @State private var hasPositionedInitialMessages = false
+    @State private var pendingNewMessageCount = 0
+    @State private var lastMarkedReadMessageID: String?
     @FocusState private var composerFocused: Bool
 
     private let chatBottomID = "chat-bottom-anchor"
@@ -594,26 +603,57 @@ private struct ChatView: View {
                                 .id(chatBottomID)
                                 .onAppear {
                                     isReviewingMessageHistory = false
+                                    pendingNewMessageCount = 0
+                                    markConversationReadIfNeeded()
                                 }
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 14)
                     }
+                    .defaultScrollAnchor(.bottom)
+                    .scrollDismissesKeyboard(.interactively)
                     .background(Color(uiColor: .systemGroupedBackground))
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 8)
                             .onChanged { value in
-                                if value.translation.height > 8 {
+                                if hasPositionedInitialMessages, value.translation.height > 8 {
                                     isReviewingMessageHistory = true
                                 }
                             }
                     )
+                    .overlay(alignment: .bottomTrailing) {
+                        if isReviewingMessageHistory {
+                            Button {
+                                isReviewingMessageHistory = false
+                                pendingNewMessageCount = 0
+                                keepChatAtBottom(using: proxy, animated: true)
+                                markConversationReadIfNeeded()
+                            } label: {
+                                Label(
+                                    pendingNewMessageCount > 99
+                                        ? "99+ 条新消息"
+                                        : (pendingNewMessageCount > 0 ? "\(pendingNewMessageCount) 条新消息" : "回到最新"),
+                                    systemImage: "arrow.down.circle.fill"
+                                )
+                                .font(.caption.bold())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 8)
+                                .background(Color.blue, in: Capsule())
+                                .shadow(color: .black.opacity(0.18), radius: 5, y: 2)
+                            }
+                            .padding(12)
+                            .accessibilityHint("点按跳到最新消息")
+                        }
+                    }
                     .onChange(of: messages.last?.id) { _ in
                         keepChatAtBottom(using: proxy, animated: true)
                     }
                     .onAppear {
                         isReviewingMessageHistory = false
-                        keepChatAtBottom(using: proxy)
+                    }
+                    .task {
+                        await positionInitialMessagesAtBottom(using: proxy)
                     }
                 }
             }
@@ -763,6 +803,9 @@ private struct ChatView: View {
                     Button { copyEmail(email) } label: {
                         VStack(spacing: 1) {
                             HStack(spacing: 5) {
+                                Circle()
+                                    .fill(appState.isRealtimeConnected ? Color.green : Color.orange)
+                                    .frame(width: 6, height: 6)
                                 Text(email).lineLimit(1)
                                 Image(systemName: "doc.on.doc").font(.caption2)
                             }
@@ -779,7 +822,12 @@ private struct ChatView: View {
                     .accessibilityHint("点按复制邮箱")
                 } else {
                     VStack(spacing: 1) {
-                        Text(liveConversation.displayName).font(.headline).lineLimit(1)
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(appState.isRealtimeConnected ? Color.green : Color.orange)
+                                .frame(width: 6, height: 6)
+                            Text(liveConversation.displayName).font(.headline).lineLimit(1)
+                        }
                         if visitorIsTyping {
                             Text("对方正在输入…")
                                 .font(.caption2)
@@ -798,7 +846,7 @@ private struct ChatView: View {
                 }
             }
         }
-        .sheet(isPresented: $showDetails) {
+        .sheet(isPresented: $showDetails, onDismiss: refreshLiveConversation) {
             ConversationDetailsView(conversation: liveConversation)
         }
         .sheet(item: $selectableText) { context in
@@ -917,6 +965,44 @@ private struct ChatView: View {
         }
     }
 
+    @MainActor
+    private func positionInitialMessagesAtBottom(using proxy: ScrollViewProxy) async {
+        guard !hasPositionedInitialMessages else { return }
+        isReviewingMessageHistory = false
+        pendingNewMessageCount = 0
+
+        // LazyVStack 首次生成大量历史消息时，单次 scrollTo 可能早于布局完成而失效。
+        // 先交还一次主线程，再在紧邻的两个布局阶段校准，只对初次进入执行。
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        proxy.scrollTo(chatBottomID, anchor: .bottom)
+        try? await Task.sleep(nanoseconds: 90_000_000)
+        guard !Task.isCancelled else { return }
+        proxy.scrollTo(chatBottomID, anchor: .bottom)
+        hasPositionedInitialMessages = true
+        markConversationReadIfNeeded()
+    }
+
+    private func markConversationReadIfNeeded() {
+        guard !isReviewingMessageHistory,
+              let client = appState.client,
+              let newestMessageID = messages.last?.id,
+              newestMessageID != lastMarkedReadMessageID else { return }
+        lastMarkedReadMessageID = newestMessageID
+        Task {
+            do {
+                try await client.markRead(conversationId: conversation.id)
+                if let updated = try? await client.conversation(id: conversation.id) {
+                    liveConversation = updated
+                }
+            } catch {
+                if lastMarkedReadMessageID == newestMessageID {
+                    lastMarkedReadMessageID = nil
+                }
+                appState.handleUnauthorized(error)
+            }
+        }
+    }
+
     private func loadMessages(showError: Bool = true) async {
         guard let client = appState.client else { return }
         messageLoadSequence += 1
@@ -939,8 +1025,13 @@ private struct ChatView: View {
             messages = deduplicatedMessages(serverMessages + pending)
             hasLoadedInitialMessages = true
             newlyDiscoveredVisitorMessages.forEach(appState.notifyForegroundVisitorMessage)
+            if isReviewingMessageHistory {
+                pendingNewMessageCount += newlyDiscoveredVisitorMessages.count
+            }
             liveConversation = try await client.conversation(id: conversation.id)
-            try? await client.markRead(conversationId: conversation.id)
+            if hasPositionedInitialMessages, !isReviewingMessageHistory {
+                markConversationReadIfNeeded()
+            }
             if showError { errorMessage = nil }
         } catch {
             guard sequence == messageLoadSequence else { return }
@@ -1017,6 +1108,7 @@ private struct ChatView: View {
                 }.value
                 try await uploadAndSend(data: jpeg, fileName: "photo-\(Int(Date().timeIntervalSince1970)).jpg", mimeType: "image/jpeg")
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
         }
@@ -1036,6 +1128,7 @@ private struct ChatView: View {
                 }.value
                 try await uploadAndSend(data: jpeg, fileName: "camera-\(Int(Date().timeIntervalSince1970)).jpg", mimeType: "image/jpeg")
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
         }
@@ -1060,6 +1153,7 @@ private struct ChatView: View {
                 }.value
                 try await uploadAndSend(data: payload.0, fileName: payload.1, mimeType: payload.2)
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
         }
@@ -1148,7 +1242,19 @@ private struct ChatView: View {
                 try await client.recall(conversationId: conversation.id, messageId: message.id)
                 await loadMessages()
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func refreshLiveConversation() {
+        Task {
+            guard let client = appState.client else { return }
+            do {
+                liveConversation = try await client.conversation(id: conversation.id)
+            } catch {
+                appState.handleUnauthorized(error)
             }
         }
     }
@@ -1162,6 +1268,7 @@ private struct ChatView: View {
                 liveConversation = try await client.conversation(id: conversation.id)
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
         }
@@ -1213,6 +1320,9 @@ private struct ChatView: View {
                 }
                 if !messages.contains(where: { $0.id == message.id }) {
                     messages.append(message)
+                    if message.sender == "visitor", isReviewingMessageHistory {
+                        pendingNewMessageCount += 1
+                    }
                 }
                 messages = deduplicatedMessages(messages)
             }
@@ -1221,8 +1331,9 @@ private struct ChatView: View {
                 if needsInitialReload {
                     await loadMessages(showError: false)
                 }
-                try? await client.markRead(conversationId: conversation.id)
-                if let updated = try? await client.conversation(id: conversation.id) {
+                if !isReviewingMessageHistory {
+                    markConversationReadIfNeeded()
+                } else if let updated = try? await client.conversation(id: conversation.id) {
                     liveConversation = updated
                 }
             }
@@ -1252,11 +1363,15 @@ private struct ChatView: View {
     }
 
     private func refreshOtherUnreadCount() async {
-        guard let client = appState.client,
-              let allConversations = try? await client.conversations() else { return }
-        otherUnreadCount = allConversations
-            .filter { $0.id != conversation.id }
-            .reduce(0) { $0 + max(0, $1.unreadCount) }
+        guard let client = appState.client else { return }
+        do {
+            let allConversations = try await client.conversations()
+            otherUnreadCount = allConversations
+                .filter { $0.id != conversation.id }
+                .reduce(0) { $0 + max(0, $1.unreadCount) }
+        } catch {
+            appState.handleUnauthorized(error)
+        }
     }
 
     private func deduplicatedMessages(_ source: [ChatMessage]) -> [ChatMessage] {
@@ -2357,8 +2472,9 @@ private struct ToolsAccessoryPanel: View {
         .background(Color(uiColor: .secondarySystemBackground))
         .task {
             do {
-                replies = try await appState.client?.cannedReplies() ?? []
+                replies = try await appState.requireClient().cannedReplies()
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
         }
@@ -2494,8 +2610,11 @@ private struct QuickRepliesView: View {
                 }
             }
             .task {
-                do { replies = try await appState.client?.cannedReplies() ?? [] }
-                catch { errorMessage = error.localizedDescription }
+                do { replies = try await appState.requireClient().cannedReplies() }
+                catch {
+                    appState.handleUnauthorized(error)
+                    errorMessage = error.localizedDescription
+                }
             }
         }
     }
@@ -2585,9 +2704,10 @@ private struct ConversationDetailsView: View {
         isSaving = true
         Task {
             do {
-                try await appState.client?.updateConversation(id: conversation.id, notes: notes, tags: tags)
+                try await appState.requireClient().updateConversation(id: conversation.id, notes: notes, tags: tags)
                 dismiss()
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
             isSaving = false
@@ -2610,6 +2730,8 @@ private struct NativeSettingsView: View {
     @State private var barkURL = ""
     @State private var isSaving = false
     @State private var message: String?
+    @State private var confirmServerChange = false
+    @State private var confirmLogout = false
 
     var body: some View {
         NavigationStack {
@@ -2617,8 +2739,7 @@ private struct NativeSettingsView: View {
                 Section("服务器") {
                     LabeledContent("域名", value: appState.serverURL?.host ?? "")
                     Button("更换服务器", role: .destructive) {
-                        appState.forgetServer()
-                        dismiss()
+                        confirmServerChange = true
                     }
                 }
                 Section("客户聊天插件") {
@@ -2677,10 +2798,7 @@ private struct NativeSettingsView: View {
                 }
                 Section {
                     Button("退出登录", role: .destructive) {
-                        Task {
-                            await appState.logout()
-                            dismiss()
-                        }
+                        confirmLogout = true
                     }
                 }
             }
@@ -2693,11 +2811,30 @@ private struct NativeSettingsView: View {
             }
             .task {
                 do {
-                    let settings = try await appState.client?.settings() ?? [:]
+                    let settings = try await appState.requireClient().settings()
                     barkURL = settings["bark_url"] ?? ""
                 } catch {
+                    appState.handleUnauthorized(error)
                     message = error.localizedDescription
                 }
+            }
+            .confirmationDialog("确定更换服务器？", isPresented: $confirmServerChange, titleVisibility: .visible) {
+                Button("更换服务器", role: .destructive) {
+                    appState.forgetServer()
+                    dismiss()
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("当前登录会退出，随后需要重新填写服务器域名并登录。")
+            }
+            .confirmationDialog("确定退出登录？", isPresented: $confirmLogout, titleVisibility: .visible) {
+                Button("退出登录", role: .destructive) {
+                    Task {
+                        await appState.logout()
+                        dismiss()
+                    }
+                }
+                Button("取消", role: .cancel) {}
             }
         }
     }
@@ -2707,9 +2844,10 @@ private struct NativeSettingsView: View {
         message = nil
         Task {
             do {
-                try await appState.client?.saveSettings(["bark_url": barkURL.trimmingCharacters(in: .whitespacesAndNewlines)])
+                try await appState.requireClient().saveSettings(["bark_url": barkURL.trimmingCharacters(in: .whitespacesAndNewlines)])
                 message = "已保存"
             } catch {
+                appState.handleUnauthorized(error)
                 message = error.localizedDescription
             }
             isSaving = false
@@ -2792,7 +2930,7 @@ private struct WidgetAppearanceSettingsView: View {
 
     private func load() async {
         do {
-            let settings = try await appState.client?.settings() ?? [:]
+            let settings = try await appState.requireClient().settings()
             title = settings["widget_title"] ?? "在线客服"
             launcherText = settings["widget_launcher_text"] ?? "点我联系客服"
             welcomeMessage = settings["widget_welcome_message"] ?? "你好呀，有什么可以帮你的？"
@@ -2800,6 +2938,7 @@ private struct WidgetAppearanceSettingsView: View {
             secondaryColor = Color(hexRGB: settings["widget_color2"] ?? "#3B82F6")
             message = nil
         } catch {
+            appState.handleUnauthorized(error)
             message = error.localizedDescription
         }
         isLoading = false
@@ -2810,7 +2949,7 @@ private struct WidgetAppearanceSettingsView: View {
         message = nil
         Task {
             do {
-                try await appState.client?.saveSettings([
+                try await appState.requireClient().saveSettings([
                     "widget_title": title.trimmingCharacters(in: .whitespacesAndNewlines),
                     "widget_color": primaryColor.hexRGB,
                     "widget_color2": secondaryColor.hexRGB,
@@ -2820,6 +2959,7 @@ private struct WidgetAppearanceSettingsView: View {
                 message = "已保存，访客刷新网页后生效"
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
+                appState.handleUnauthorized(error)
                 message = error.localizedDescription
             }
             isSaving = false
@@ -2904,9 +3044,10 @@ private struct CannedReplyManagementView: View {
 
     private func load() async {
         do {
-            replies = try await appState.client?.cannedReplies() ?? []
+            replies = try await appState.requireClient().cannedReplies()
             errorMessage = nil
         } catch {
+            appState.handleUnauthorized(error)
             errorMessage = error.localizedDescription
         }
         isLoading = false
@@ -2915,9 +3056,10 @@ private struct CannedReplyManagementView: View {
     private func delete(_ reply: CannedReply) {
         Task {
             do {
-                try await appState.client?.deleteCannedReply(id: reply.id)
+                try await appState.requireClient().deleteCannedReply(id: reply.id)
                 replies.removeAll { $0.id == reply.id }
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
         }
@@ -2967,13 +3109,14 @@ private struct CannedReplyEditorView: View {
                 let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
                 let cleanContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 if let reply {
-                    try await appState.client?.updateCannedReply(id: reply.id, title: cleanTitle, content: cleanContent)
+                    try await appState.requireClient().updateCannedReply(id: reply.id, title: cleanTitle, content: cleanContent)
                 } else {
-                    _ = try await appState.client?.createCannedReply(title: cleanTitle, content: cleanContent)
+                    _ = try await appState.requireClient().createCannedReply(title: cleanTitle, content: cleanContent)
                 }
                 onSaved()
                 dismiss()
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
             isSaving = false
@@ -3069,9 +3212,10 @@ private struct WidgetMenuSettingsView: View {
 
     private func load() async {
         do {
-            items = try await appState.client?.menuItems() ?? []
+            items = try await appState.requireClient().menuItems()
             errorMessage = nil
         } catch {
+            appState.handleUnauthorized(error)
             errorMessage = error.localizedDescription
         }
         isLoading = false
@@ -3080,9 +3224,10 @@ private struct WidgetMenuSettingsView: View {
     private func delete(_ item: WidgetMenuItem) {
         Task {
             do {
-                try await appState.client?.deleteMenuItem(id: item.id)
+                try await appState.requireClient().deleteMenuItem(id: item.id)
                 await load()
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
         }
@@ -3172,7 +3317,7 @@ private struct WidgetMenuEditorView: View {
                 let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
                 let cleanContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 if let item {
-                    try await appState.client?.updateMenuItem(
+                    try await appState.requireClient().updateMenuItem(
                         id: item.id,
                         parentId: parentID,
                         title: cleanTitle,
@@ -3180,7 +3325,7 @@ private struct WidgetMenuEditorView: View {
                         sortOrder: sortOrder
                     )
                 } else {
-                    _ = try await appState.client?.createMenuItem(
+                    _ = try await appState.requireClient().createMenuItem(
                         parentId: parentID,
                         title: cleanTitle,
                         content: cleanContent,
@@ -3190,6 +3335,7 @@ private struct WidgetMenuEditorView: View {
                 onSaved()
                 dismiss()
             } catch {
+                appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
             }
             isSaving = false

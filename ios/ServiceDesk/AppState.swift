@@ -39,6 +39,11 @@ final class AppState: ObservableObject {
         return APIClient(baseURL: serverURL, token: token)
     }
 
+    func requireClient() throws -> APIClient {
+        guard token != nil, let client else { throw AppClientError.unauthorized }
+        return client
+    }
+
     func bootstrap() async {
         defer { isCheckingSession = false }
         guard serverURL != nil, token != nil, let client else { return }
@@ -223,6 +228,7 @@ final class AppState: ObservableObject {
         presenceTask = nil
         isRealtimeConnected = false
         lastEvent = nil
+        pendingConversationID = nil
         lastNativeEventID = nil
         notifiedMessageKeys.removeAll()
         notifiedMessageKeyOrder.removeAll()
