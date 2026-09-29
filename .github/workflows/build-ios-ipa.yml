@@ -19,6 +19,14 @@ jobs:
           cd server
           npm audit --omit=dev
 
+      - name: Check iOS interaction logic
+        run: |
+          swiftc ios/ServiceDesk/Models.swift \
+            ios/ServiceDesk/ChatInteractionState.swift \
+            ios/Tests/main.swift \
+            -o "$RUNNER_TEMP/chat-interaction-tests"
+          "$RUNNER_TEMP/chat-interaction-tests"
+
       - name: Build unsigned app
         run: |
           xcodebuild \
@@ -41,6 +49,6 @@ jobs:
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: ServiceDesk-1.3.0-build21-unsigned-ipa
+          name: ServiceDesk-1.3.0-build22-unsigned-ipa
           path: build/ServiceDesk-unsigned.ipa
           if-no-files-found: error

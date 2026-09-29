@@ -76,6 +76,7 @@ struct APIClient {
         let body = try JSONSerialization.data(withJSONObject: payload)
         var lastError: Error = AppClientError.invalidResponse
         for attempt in 0..<3 {
+            try Task.checkCancellation()
             do {
                 return try await request(
                     path: "/api/conversations/\(escaped(conversationId))/messages",
@@ -84,14 +85,17 @@ struct APIClient {
                     timeout: 20
                 )
             } catch {
+                try Task.checkCancellation()
                 lastError = error
                 guard shouldRetry(error), attempt < 2 else { break }
-                try? await Task.sleep(nanoseconds: UInt64(350 + attempt * 650) * 1_000_000)
+                try await Task.sleep(nanoseconds: UInt64(350 + attempt * 650) * 1_000_000)
             }
         }
 
         // POST可能已经落库，只是成功回包在弱网中丢失。按幂等ID回查后再决定是否提示失败。
-        if let recoveredMessages = try? await messages(conversationId: conversationId),
+        try Task.checkCancellation()
+        if shouldRetry(lastError),
+           let recoveredMessages = try? await messages(conversationId: conversationId),
            let recovered = recoveredMessages.first(where: { $0.id == messageId }) {
             return recovered
         }
@@ -325,7 +329,7 @@ struct APIClient {
         if http.statusCode == 401 { throw AppClientError.unauthorized }
         guard (200..<300).contains(http.statusCode) else {
             let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            let message = payload?["error"] as? String ?? "请求失败（\(http.statusCode)）"
+            let message = (payload?["error"] as? String) ?? "请求失败（\(http.statusCode)）"
             throw AppClientError.server(http.statusCode, message)
         }
         return data

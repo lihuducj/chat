@@ -92,7 +92,7 @@ location = /api/native/events {
 
 1. 把整个 `customer-service` 文件夹上传到自己的 GitHub 仓库。
 2. 打开 Actions → `Build unsigned iOS IPA` → Run workflow。
-3. 下载 `ServiceDesk-1.3.0-build21-unsigned-ipa` artifact，解压得到 `ServiceDesk-unsigned.ipa`。
+3. 下载 `ServiceDesk-1.3.0-build22-unsigned-ipa` artifact，解压得到 `ServiceDesk-unsigned.ipa`。
 4. 用自己的签名工具重签并安装。
 
 未签名 IPA 不能直接安装。免费 Apple ID 签名通常需要定期续签，具体有效期由 Apple 账号和签名工具决定。
@@ -113,7 +113,7 @@ chat.example.com
 
 此版本不包含 APNs entitlement。App 在前台时通过 SSE、App 内提示音和未读数字立即提醒，并主动抑制重复的 Bark；切到后台、锁屏或被系统清理后恢复 Bark 提醒。必须在 App 设置中保存 Bark 地址，否则后台没有系统通知。服务器发送 Bark 通知时会附带当前未读总数角标，并使用时效性通知；需要在 iPhone“设置 → 通知 → Bark”中开启锁定屏幕、横幅、声音、标记和时效性通知。
 
-PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。当前版本号为 1.3.0（build 21）。消息正文可自动识别 `https://example.com`、`www.example.com` 等网址，点击后由 iOS 默认浏览器打开，同时保留长按选择与复制文字。
+PWA Web Push 与原生 App 是两个不同身份，不能直接沿用。1.2.2 起 Bark 通知携带 `servicedesk://conversation/<会话ID>`，点击后会直接打开原生 App 并进入对应会话。当前版本号为 1.3.0（build 22）。消息正文可自动识别 `https://example.com`、`www.example.com` 等网址，点击后由 iOS 默认浏览器打开，同时保留长按选择与复制文字。
 
 build 15 的图片预览改为直接使用 iOS 原生 VisionKit 相册式实况文本界面：系统会在图片内显示实况文本按钮，并根据识别内容提供“翻译”等快捷操作，可选择和复制任意一段文字。已删除自定义整图翻译页面及其 TranslationSession，避免点击翻译闪退；图片仍支持双击缩放、双指缩放和自由拖动。APP 最低系统版本为 iOS 17。
 
@@ -128,3 +128,7 @@ build 19 优化图片链路：相册原图先在后台线程缩放并自适应�
 build 20 修复前台实时刷新：App 回到前台会重建 SSE 连接，服务器按 eventId 补发断线事件；会话列表和当前聊天加入 4–5 秒轻量对账。轮询发现被长连接漏掉的客户消息也会触发一次去重的 App 内声音/震动提醒，并修复同毫秒消息可能取错“最后一条”的排序问题。
 
 build 21 修复从 App 会话列表直接打开未读会话时偶尔停在第一条的问题：首次进入采用底部锚点并在布局完成后校准。用户查看历史消息时不再被新消息或图片加载强制拉回底部，而是在右下角显示“回到最新 / N 条新消息”；只有回到底部后才标记已读。不同会话不再复用旧聊天页状态，从资料页返回会重新读取资料，从聊天返回列表会立即对账。退出登录和更换服务器增加二次确认，登录失效也会由所有设置与上传操作统一处理。
+
+build 22 改用消息列表实际可见范围判断是否到底，移除底部占位预加载触发的错误已读、全局底部锚点和互相打断的滚动动画。键盘、多行输入、引用栏、表情面板和图片加载改变高度时，由同一个可取消任务保持最新消息可见；手动阅读历史时保留位置。资料、图片、全文弹层及后台期间暂停已读。在线状态上报不再阻塞 SSE 消息处理；相同内容的回复按幂等 ID 匹配，发送失败保留原消息和新输入草稿，常用语追加到现有草稿，连续推送跳转及搜索不再被旧请求覆盖。此更新只需重新打包 iOS App，不需要更新服务器。
+
+GitHub 打包会先执行 `ios/Tests/main.swift` 中的交互回归检查，再编译 IPA；测试覆盖滚动意图、键盘遮挡、历史阅读、弹层已读保护和重复消息匹配。Windows 上的语法解析不等同于 Xcode 编译或 iPhone 真机验收。

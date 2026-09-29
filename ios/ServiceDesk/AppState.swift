@@ -26,7 +26,7 @@ final class AppState: ObservableObject {
     private var notifiedMessageKeyOrder: [String] = []
 
     init() {
-        foregroundSoundEnabled = UserDefaults.standard.object(forKey: foregroundSoundKey) as? Bool ?? true
+        foregroundSoundEnabled = (UserDefaults.standard.object(forKey: foregroundSoundKey) as? Bool) ?? true
         autoTranslateEnabled = UserDefaults.standard.bool(forKey: autoTranslateKey)
         if let value = UserDefaults.standard.string(forKey: serverKey) {
             serverURL = URL(string: value)
@@ -87,11 +87,12 @@ final class AppState: ObservableObject {
     }
 
     func logout() async {
-        if let client {
+        let previousClient = client
+        clearToken()
+        if let client = previousClient {
             try? await client.reportNativePresence(active: false)
             try? await client.logout()
         }
-        clearToken()
     }
 
     func forgetServer() {
@@ -173,7 +174,7 @@ final class AppState: ObservableObject {
 
     private func startEventStream() {
         eventTask?.cancel()
-        guard let client, token != nil else { return }
+        guard appIsForeground, let client, token != nil else { return }
         isRealtimeConnected = false
 
         eventTask = Task { [weak self] in
@@ -191,9 +192,9 @@ final class AppState: ObservableObject {
                         if event.type == "connected" || event.type == "heartbeat" {
                             isRealtimeConnected = true
                             sessionMessage = nil
-                            if appIsForeground {
-                                try? await client.reportNativePresence(active: true)
-                            }
+                            // Presence uses its own task; a slow POST must never block
+                            // delivery of the next SSE message on this stream.
+                            if event.type == "connected" { restartPresenceReportingIfNeeded() }
                         } else {
                             lastEvent = event
                             if appIsForeground,
@@ -207,9 +208,7 @@ final class AppState: ObservableObject {
                 } catch {
                     guard let self, !Task.isCancelled else { return }
                     isRealtimeConnected = false
-                    if appIsForeground {
-                        try? await client.reportNativePresence(active: false)
-                    }
+                    restartPresenceReportingIfNeeded()
                     if case AppClientError.unauthorized = error {
                         clearToken()
                         sessionMessage = error.localizedDescription

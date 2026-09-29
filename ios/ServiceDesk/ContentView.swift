@@ -183,6 +183,7 @@ private enum InboxFilter: String, CaseIterable, Identifiable {
 
 private struct ConversationListView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.scenePhase) private var scenePhase
     @State private var conversations: [Conversation] = []
     @State private var search = ""
     @State private var isLoading = true
@@ -319,7 +320,8 @@ private struct ConversationListView: View {
                 guard ["new_message", "conversation_updated", "conversation_deleted", "message_recalled"].contains(event.type) else { return }
                 scheduleEventRefresh()
             }
-            .task(id: search) {
+            .task(id: "\(scenePhase)-\(search)") {
+                guard scenePhase == .active else { return }
                 if !search.isEmpty {
                     try? await Task.sleep(nanoseconds: 300_000_000)
                 }
@@ -342,6 +344,7 @@ private struct ConversationListView: View {
                 guard count == 0 else { return }
                 Task { await load(showSpinner: false) }
             }
+            .onDisappear { eventRefreshTask?.cancel() }
         }
     }
 
@@ -349,12 +352,14 @@ private struct ConversationListView: View {
         guard let client = appState.client else { return }
         do {
             let conversation = try await client.conversation(id: conversationID)
+            guard !Task.isCancelled, appState.pendingConversationID == conversationID else { return }
             if navigationPath.last?.id != conversation.id {
                 navigationPath = [conversation]
             }
             appState.consumeConversationDeepLink(conversationID)
             errorMessage = nil
         } catch {
+            guard !Task.isCancelled, appState.pendingConversationID == conversationID else { return }
             appState.consumeConversationDeepLink(conversationID)
             appState.handleUnauthorized(error)
             errorMessage = "无法打开推送对应的会话：\(error.localizedDescription)"
@@ -367,9 +372,11 @@ private struct ConversationListView: View {
         let sequence = loadSequence
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
         if showSpinner { isLoading = true }
+        defer { if sequence == loadSequence { isLoading = false } }
         do {
             let result = try await client.conversations(search: query)
-            guard sequence == loadSequence else { return }
+            guard !Task.isCancelled, sequence == loadSequence,
+                  query == search.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
             if query.isEmpty {
                 if hasLoadedConversationBaseline {
                     for conversation in result where conversation.unreadCount > 0 {
@@ -393,11 +400,10 @@ private struct ConversationListView: View {
             }
             errorMessage = nil
         } catch {
-            guard sequence == loadSequence else { return }
+            guard !Task.isCancelled, sequence == loadSequence else { return }
             appState.handleUnauthorized(error)
             errorMessage = error.localizedDescription
         }
-        isLoading = false
     }
 
     private func syncAppBadge(_ unreadCount: Int) {
@@ -425,7 +431,9 @@ private struct ConversationListView: View {
             guard let client = appState.client else { return }
             do {
                 try await client.deleteConversation(id: conversation.id)
+                loadSequence += 1
                 conversations.removeAll { $0.id == conversation.id }
+                await load(showSpinner: false)
             } catch {
                 appState.handleUnauthorized(error)
                 errorMessage = error.localizedDescription
@@ -519,9 +527,23 @@ private enum ComposerPanel: Equatable {
     case tools
 }
 
+private struct ChatTimelineLayout: Equatable {
+    let frame: CGRect
+    let lastMessageID: String?
+}
+
+private struct ChatTimelineLayoutKey: PreferenceKey {
+    static var defaultValue: ChatTimelineLayout? { nil }
+
+    static func reduce(value: inout ChatTimelineLayout?, nextValue: () -> ChatTimelineLayout?) {
+        if let next = nextValue() { value = next }
+    }
+}
+
 private struct ChatView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     let conversation: Conversation
 
     @State private var liveConversation: Conversation
@@ -547,14 +569,28 @@ private struct ChatView: View {
     @State private var unreadRefreshTask: Task<Void, Never>?
     @State private var otherUnreadCount = 0
     @State private var messageLoadSequence = 0
-    @State private var isReviewingMessageHistory = false
+    @State private var conversationLoadSequence = 0
+    @State private var unreadLoadSequence = 0
+    @State private var scrollState = ChatScrollState()
+    @State private var scrollTask: Task<Void, Never>?
+    @State private var readTask: Task<Void, Never>?
+    @State private var timelineLayout: ChatTimelineLayout?
+    @State private var isChatVisible = false
+    @State private var showExpandedText = false
+    @State private var isChangingStatus = false
     @State private var hasLoadedInitialMessages = false
-    @State private var hasPositionedInitialMessages = false
-    @State private var pendingNewMessageCount = 0
     @State private var lastMarkedReadMessageID: String?
     @FocusState private var composerFocused: Bool
 
     private let chatBottomID = "chat-bottom-anchor"
+    private let timelineSpace = "chat-timeline-viewport"
+
+    private var canReadConversation: Bool {
+        isChatVisible && scenePhase == .active
+            && !showDetails && !showCamera && !showPhotoPicker && !showFileImporter
+            && previewImageURL == nil && selectableText == nil
+            && !showExpandedText && pendingRecall == nil
+    }
 
     init(conversation: Conversation) {
         self.conversation = conversation
@@ -568,94 +604,7 @@ private struct ChatView: View {
                 ProgressView("加载消息…")
                 Spacer()
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 10) {
-                            ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
-                                if shouldShowDateSeparator(at: index) {
-                                    ChatDateSeparator(
-                                        title: DisplayFormatters.chatDayLabel(milliseconds: message.createdAt)
-                                    )
-                                }
-                                MessageBubble(
-                                    message: message,
-                                    client: appState.client,
-                                    receipt: receiptState(for: message),
-                                    autoTranslate: appState.autoTranslateEnabled && !message.isAgent,
-                                    onImageTap: { previewImageURL = $0 },
-                                    onImageLoaded: {
-                                        keepChatAtBottom(using: proxy)
-                                    },
-                                    onQuote: {
-                                        quotedText = message.content
-                                        composerFocused = true
-                                    },
-                                    onSelectText: {
-                                        selectableText = SelectableTextContext(text: message.content)
-                                    },
-                                    onRecall: { pendingRecall = message }
-                                )
-                                .id(message.id)
-                            }
-
-                            Color.clear
-                                .frame(height: 1)
-                                .id(chatBottomID)
-                                .onAppear {
-                                    isReviewingMessageHistory = false
-                                    pendingNewMessageCount = 0
-                                    markConversationReadIfNeeded()
-                                }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 14)
-                    }
-                    .defaultScrollAnchor(.bottom)
-                    .scrollDismissesKeyboard(.interactively)
-                    .background(Color(uiColor: .systemGroupedBackground))
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 8)
-                            .onChanged { value in
-                                if hasPositionedInitialMessages, value.translation.height > 8 {
-                                    isReviewingMessageHistory = true
-                                }
-                            }
-                    )
-                    .overlay(alignment: .bottomTrailing) {
-                        if isReviewingMessageHistory {
-                            Button {
-                                isReviewingMessageHistory = false
-                                pendingNewMessageCount = 0
-                                keepChatAtBottom(using: proxy, animated: true)
-                                markConversationReadIfNeeded()
-                            } label: {
-                                Label(
-                                    pendingNewMessageCount > 99
-                                        ? "99+ 条新消息"
-                                        : (pendingNewMessageCount > 0 ? "\(pendingNewMessageCount) 条新消息" : "回到最新"),
-                                    systemImage: "arrow.down.circle.fill"
-                                )
-                                .font(.caption.bold())
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 11)
-                                .padding(.vertical, 8)
-                                .background(Color.blue, in: Capsule())
-                                .shadow(color: .black.opacity(0.18), radius: 5, y: 2)
-                            }
-                            .padding(12)
-                            .accessibilityHint("点按跳到最新消息")
-                        }
-                    }
-                    .onChange(of: messages.last?.id) { _ in
-                        keepChatAtBottom(using: proxy, animated: true)
-                    }
-                    .onAppear {
-                        isReviewingMessageHistory = false
-                    }
-                    .task {
-                        await positionInitialMessagesAtBottom(using: proxy)
-                    }
-                }
+                messageTimeline
             }
 
             if let errorMessage {
@@ -761,17 +710,17 @@ private struct ChatView: View {
                                 showFileImporter = true
                             },
                             onQuickReply: { content in
-                                draft = content
+                                draft += draft.isEmpty ? content : "\n" + content
+                                closeComposerPanel()
+                                composerFocused = true
                             },
                             onClose: closeComposerPanel
                         )
                     }
                 }
                 .frame(height: 220)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: composerPanel)
         .navigationTitle(liveConversation.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .overlay(alignment: .top) {
@@ -841,6 +790,7 @@ private struct ChatView: View {
                     Image(systemName: liveConversation.status == "closed" ? "arrow.uturn.backward.circle" : "checkmark.circle")
                 }
                 .accessibilityLabel(liveConversation.status == "closed" ? "重新打开会话" : "结束会话")
+                .disabled(isChangingStatus)
                 Button { showDetails = true } label: {
                     Image(systemName: "person.text.rectangle")
                 }
@@ -864,8 +814,10 @@ private struct ChatView: View {
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $photoItem, matching: .images)
         .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item]) { result in
-            guard case let .success(url) = result else { return }
-            uploadFile(url)
+            switch result {
+            case .success(let url): uploadFile(url)
+            case .failure(let error): errorMessage = error.localizedDescription
+            }
         }
         .fullScreenCover(isPresented: $showCamera) {
             NativeCameraPicker { image in
@@ -882,9 +834,7 @@ private struct ChatView: View {
         }
         .onChange(of: composerFocused) { isFocused in
             if isFocused, composerPanel != nil {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    composerPanel = nil
-                }
+                composerPanel = nil
             }
         }
         .confirmationDialog(
@@ -907,17 +857,25 @@ private struct ChatView: View {
             handleRealtimeEvent(event)
         }
         .onDisappear {
+            isChatVisible = false
+            messageLoadSequence += 1
+            conversationLoadSequence += 1
+            unreadLoadSequence += 1
+            scrollTask?.cancel()
+            readTask?.cancel()
             typingTask?.cancel()
             typingTask = nil
             typingHideTask?.cancel()
             unreadRefreshTask?.cancel()
         }
         .onAppear {
+            isChatVisible = true
             if draft.isEmpty {
                 draft = UserDefaults.standard.string(forKey: draftStorageKey) ?? ""
             }
         }
-        .task {
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
             await loadMessages()
             await refreshOtherUnreadCount()
             while !Task.isCancelled {
@@ -930,74 +888,206 @@ private struct ChatView: View {
         }
     }
 
+    private var messageTimeline: some View {
+        GeometryReader { viewport in
+          ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
+                        if shouldShowDateSeparator(at: index) {
+                            ChatDateSeparator(
+                                title: DisplayFormatters.chatDayLabel(milliseconds: message.createdAt)
+                            )
+                        }
+                        MessageBubble(
+                            message: message,
+                            client: appState.client,
+                            receipt: receiptState(for: message),
+                            autoTranslate: appState.autoTranslateEnabled && !message.isAgent,
+                            onImageTap: { previewImageURL = $0 },
+                            onImageLoaded: {
+                                keepChatAtBottom(using: proxy)
+                            },
+                            onQuote: {
+                                quotedText = message.content
+                                composerFocused = true
+                            },
+                            onSelectText: {
+                                selectableText = SelectableTextContext(text: message.content)
+                            },
+                            onRecall: { pendingRecall = message },
+                            onPresentationChanged: { showExpandedText = $0 }
+                        )
+                        .id(message.id)
+                    }
+
+                    Color.clear
+                        .frame(height: 14)
+                        .id(chatBottomID)
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 14)
+                .background {
+                    GeometryReader { content in
+                        Color.clear.preference(
+                            key: ChatTimelineLayoutKey.self,
+                            value: ChatTimelineLayout(
+                                frame: content.frame(in: .named(timelineSpace)),
+                                lastMessageID: messages.last?.id
+                            )
+                        )
+                    }
+                }
+            }
+            .coordinateSpace(name: timelineSpace)
+            .scrollDismissesKeyboard(.interactively)
+            .background(Color(uiColor: .systemGroupedBackground))
+            .clipped()
+            .opacity(scrollState.hasPositioned || messages.isEmpty ? 1 : 0)
+            .allowsHitTesting(scrollState.hasPositioned || messages.isEmpty)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 8)
+                    .onChanged { _ in
+                        scrollState.beginDragging()
+                        scrollTask?.cancel()
+                        readTask?.cancel()
+                    }
+                    .onEnded { _ in
+                        scrollState.endDragging()
+                        markConversationReadIfNeeded()
+                    }
+            )
+            .overlay(alignment: .bottomTrailing) {
+                if !scrollState.followsLatest {
+                    Button {
+                        scrollState.requestLatest()
+                        keepChatAtBottom(using: proxy)
+                    } label: {
+                        Label(
+                            scrollState.pendingMessageCount > 99
+                                ? "99+ 条新消息"
+                                : (scrollState.pendingMessageCount > 0 ? "\(scrollState.pendingMessageCount) 条新消息" : "回到最新"),
+                            systemImage: "arrow.down.circle.fill"
+                        )
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 8)
+                        .background(Color.blue, in: Capsule())
+                        .shadow(color: .black.opacity(0.18), radius: 5, y: 2)
+                    }
+                    .padding(12)
+                    .accessibilityHint("点按跳到最新消息")
+                }
+            }
+            .onPreferenceChange(ChatTimelineLayoutKey.self) { layout in
+                guard let layout else { return }
+                let previousSize = timelineLayout?.frame.size
+                timelineLayout = layout
+                scrollState.updateGeometry(
+                    contentBottom: Double(layout.frame.maxY),
+                    viewportHeight: Double(viewport.size.height)
+                )
+                if previousSize != layout.frame.size {
+                    keepChatAtBottom(using: proxy)
+                }
+                markConversationReadIfNeeded()
+            }
+            .onChange(of: viewport.size) { _ in
+                // The viewport excludes the composer. This also covers keyboard,
+                // multiline draft, quote bar, accessory panel and rotation changes.
+                if let layout = timelineLayout {
+                    scrollState.updateGeometry(
+                        contentBottom: Double(layout.frame.maxY),
+                        viewportHeight: Double(viewport.size.height)
+                    )
+                }
+                keepChatAtBottom(using: proxy)
+            }
+            .onChange(of: messages.last?.id) { _ in
+                keepChatAtBottom(using: proxy)
+            }
+            .onChange(of: scrollState.followsLatest) { follows in
+                if follows { keepChatAtBottom(using: proxy) }
+            }
+            .onChange(of: canReadConversation) { canRead in
+                if canRead {
+                    keepChatAtBottom(using: proxy)
+                    markConversationReadIfNeeded()
+                } else {
+                    scrollTask?.cancel()
+                    readTask?.cancel()
+                }
+            }
+            .task(id: isLoading) {
+                if !isLoading { keepChatAtBottom(using: proxy) }
+            }
+          }
+        }
+    }
+
     private func toggleComposerPanel(_ panel: ComposerPanel) {
-        composerFocused = false
-        withAnimation(.easeInOut(duration: 0.2)) {
-            composerPanel = composerPanel == panel ? nil : panel
+        if composerPanel == panel {
+            composerPanel = nil
+            composerFocused = true
+        } else {
+            composerFocused = false
+            composerPanel = panel
         }
     }
 
     private func closeComposerPanel() {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            composerPanel = nil
-        }
+        composerPanel = nil
     }
 
-    private func keepChatAtBottom(using proxy: ScrollViewProxy, animated: Bool = false) {
-        guard !isReviewingMessageHistory else { return }
-
-        DispatchQueue.main.async {
-            guard !isReviewingMessageHistory else { return }
-            if animated {
-                withAnimation(.easeOut(duration: 0.18)) {
+    private func keepChatAtBottom(using proxy: ScrollViewProxy) {
+        guard scrollState.shouldFollowLatest, canReadConversation else { return }
+        scrollTask?.cancel()
+        scrollTask = Task { @MainActor in
+            // A single cancellable owner adjusts after layout. Never mix an animated
+            // scroll with an unanimated correction, or fight a user's drag.
+            await Task.yield()
+            for delay in [UInt64(0), 80_000_000] {
+                do {
+                    if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                } catch { return }
+                guard !Task.isCancelled, scrollState.shouldFollowLatest,
+                      canReadConversation else { return }
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
                     proxy.scrollTo(chatBottomID, anchor: .bottom)
                 }
-            } else {
-                proxy.scrollTo(chatBottomID, anchor: .bottom)
             }
-
-            // 长文本换行和图片成功态都可能比第一轮布局晚一帧完成。
-            // 第二次只做紧邻的布局校准，不使用定时轮询，也不会在用户查看历史时抢滚动位置。
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                guard !isReviewingMessageHistory else { return }
-                proxy.scrollTo(chatBottomID, anchor: .bottom)
-            }
+            scrollState.didPosition()
+            markConversationReadIfNeeded()
         }
-    }
-
-    @MainActor
-    private func positionInitialMessagesAtBottom(using proxy: ScrollViewProxy) async {
-        guard !hasPositionedInitialMessages else { return }
-        isReviewingMessageHistory = false
-        pendingNewMessageCount = 0
-
-        // LazyVStack 首次生成大量历史消息时，单次 scrollTo 可能早于布局完成而失效。
-        // 先交还一次主线程，再在紧邻的两个布局阶段校准，只对初次进入执行。
-        try? await Task.sleep(nanoseconds: 20_000_000)
-        proxy.scrollTo(chatBottomID, anchor: .bottom)
-        try? await Task.sleep(nanoseconds: 90_000_000)
-        guard !Task.isCancelled else { return }
-        proxy.scrollTo(chatBottomID, anchor: .bottom)
-        hasPositionedInitialMessages = true
-        markConversationReadIfNeeded()
     }
 
     private func markConversationReadIfNeeded() {
-        guard !isReviewingMessageHistory,
+        guard scrollState.canMarkRead(
+                  isReadable: canReadConversation,
+                  hasLoadedMessages: hasLoadedInitialMessages,
+                  layoutIsCurrent: timelineLayout?.lastMessageID == messages.last?.id
+              ),
               let client = appState.client,
-              let newestMessageID = messages.last?.id,
-              newestMessageID != lastMarkedReadMessageID else { return }
-        lastMarkedReadMessageID = newestMessageID
-        Task {
+              let newestMessageID = messages.last(where: { $0.sender == "visitor" })?.id,
+              newestMessageID != lastMarkedReadMessageID,
+              readTask == nil else { return }
+        readTask = Task { @MainActor in
+            defer { readTask = nil }
             do {
+                try await Task.sleep(nanoseconds: 180_000_000)
+                guard !Task.isCancelled, scrollState.canMarkRead(
+                          isReadable: canReadConversation,
+                          hasLoadedMessages: hasLoadedInitialMessages,
+                          layoutIsCurrent: timelineLayout?.lastMessageID == messages.last?.id
+                      ),
+                      messages.last(where: { $0.sender == "visitor" })?.id == newestMessageID else { return }
                 try await client.markRead(conversationId: conversation.id)
-                if let updated = try? await client.conversation(id: conversation.id) {
-                    liveConversation = updated
-                }
+                lastMarkedReadMessageID = newestMessageID
             } catch {
-                if lastMarkedReadMessageID == newestMessageID {
-                    lastMarkedReadMessageID = nil
-                }
+                guard !Task.isCancelled else { return }
                 appState.handleUnauthorized(error)
             }
         }
@@ -1007,46 +1097,41 @@ private struct ChatView: View {
         guard let client = appState.client else { return }
         messageLoadSequence += 1
         let sequence = messageLoadSequence
+        defer { if sequence == messageLoadSequence { isLoading = false } }
         do {
             let serverMessages = try await client.messages(conversationId: conversation.id)
-            guard sequence == messageLoadSequence else { return }
+            guard !Task.isCancelled, sequence == messageLoadSequence else { return }
             let knownMessageIDs = Set(messages.lazy.filter { !$0.isPending }.map(\.id))
             let newlyDiscoveredVisitorMessages = hasLoadedInitialMessages
                 ? serverMessages.filter { $0.sender == "visitor" && !knownMessageIDs.contains($0.id) }
                 : []
-            var pending = messages.filter(\.isPending)
-            for serverMessage in serverMessages where serverMessage.isAgent {
-                if let index = pending.firstIndex(where: {
-                    $0.type == serverMessage.type && $0.content == serverMessage.content
-                }) {
-                    pending.remove(at: index)
-                }
-            }
-            messages = deduplicatedMessages(serverMessages + pending)
+            messages = ChatMessageReconciliation.merge(server: serverMessages, local: messages)
             hasLoadedInitialMessages = true
+            isLoading = false
             newlyDiscoveredVisitorMessages.forEach(appState.notifyForegroundVisitorMessage)
-            if isReviewingMessageHistory {
-                pendingNewMessageCount += newlyDiscoveredVisitorMessages.count
-            }
-            liveConversation = try await client.conversation(id: conversation.id)
-            if hasPositionedInitialMessages, !isReviewingMessageHistory {
-                markConversationReadIfNeeded()
-            }
+            scrollState.receivedVisitorMessages(newlyDiscoveredVisitorMessages.map(\.id))
+            await refreshConversation()
+            guard !Task.isCancelled, sequence == messageLoadSequence else { return }
+            markConversationReadIfNeeded()
             if showError { errorMessage = nil }
         } catch {
-            guard sequence == messageLoadSequence else { return }
+            guard !Task.isCancelled, sequence == messageLoadSequence else { return }
             appState.handleUnauthorized(error)
             if showError { errorMessage = error.localizedDescription }
         }
-        isLoading = false
     }
 
     private func sendText() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let client = appState.client else { return }
+        guard !isSending, !text.isEmpty, let client = appState.client else { return }
         let quote = quotedText
         let outgoingText = quote.map { "「\($0)」\n\(text)" } ?? text
-        let localId = "local-\(UUID().uuidString)"
+        guard outgoingText.utf16.count <= 10_000 else {
+            errorMessage = "消息连同引用不能超过 10000 个字符，请分段发送。"
+            return
+        }
+        let clientMessageID = "ios-\(UUID().uuidString)"
+        let localId = ChatMessageReconciliation.localID(for: clientMessageID)
         let pending = ChatMessage(
             id: localId,
             conversationId: conversation.id,
@@ -1060,7 +1145,9 @@ private struct ChatView: View {
         )
         draft = ""
         quotedText = nil
-        isReviewingMessageHistory = false
+        UserDefaults.standard.removeObject(forKey: draftStorageKey)
+        scrollState.requestLatest()
+        messageLoadSequence += 1
         messages.append(pending)
         isSending = true
         Task {
@@ -1069,8 +1156,10 @@ private struct ChatView: View {
                 let message = try await client.sendMessage(
                     conversationId: conversation.id,
                     type: "text",
-                    content: outgoingText
+                    content: outgoingText,
+                    clientMessageId: clientMessageID
                 )
+                messageLoadSequence += 1
                 messages.removeAll { $0.id == localId }
                 if !messages.contains(where: { $0.id == message.id }) {
                     messages.append(message)
@@ -1079,11 +1168,20 @@ private struct ChatView: View {
                 errorMessage = nil
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
             } catch {
+                messageLoadSequence += 1
                 messages.removeAll { $0.id == localId }
-                draft = text
-                quotedText = quote
+                // A slow failed request must not overwrite the next reply being typed.
+                if draft.isEmpty && quotedText == nil {
+                    draft = text
+                    quotedText = quote
+                } else {
+                    let nextDraft = quotedText.map { "「\($0)」\n\(draft)" } ?? draft
+                    draft = outgoingText + (nextDraft.isEmpty ? "" : "\n\n" + nextDraft)
+                    quotedText = nil
+                }
+                UserDefaults.standard.set(draft, forKey: draftStorageKey)
                 appState.handleUnauthorized(error)
-                errorMessage = error.localizedDescription
+                errorMessage = "发送失败，原消息已保留在草稿中：\(error.localizedDescription)"
             }
         }
     }
@@ -1172,8 +1270,9 @@ private struct ChatView: View {
             fileName: upload.name,
             fileSize: upload.size
         )
+        messageLoadSequence += 1
+        scrollState.requestLatest()
         if !messages.contains(where: { $0.id == message.id }) {
-            isReviewingMessageHistory = false
             messages.append(message)
         }
         messages = deduplicatedMessages(messages)
@@ -1249,23 +1348,33 @@ private struct ChatView: View {
     }
 
     private func refreshLiveConversation() {
-        Task {
-            guard let client = appState.client else { return }
-            do {
-                liveConversation = try await client.conversation(id: conversation.id)
-            } catch {
-                appState.handleUnauthorized(error)
-            }
+        Task { await refreshConversation() }
+    }
+
+    private func refreshConversation() async {
+        guard let client = appState.client else { return }
+        conversationLoadSequence += 1
+        let sequence = conversationLoadSequence
+        do {
+            let updated = try await client.conversation(id: conversation.id)
+            guard !Task.isCancelled, sequence == conversationLoadSequence else { return }
+            liveConversation = updated
+        } catch {
+            guard !Task.isCancelled, sequence == conversationLoadSequence else { return }
+            appState.handleUnauthorized(error)
         }
     }
 
     private func toggleConversationStatus() {
+        guard !isChangingStatus else { return }
+        isChangingStatus = true
         let next = liveConversation.status == "closed" ? "open" : "closed"
         Task {
+            defer { isChangingStatus = false }
             guard let client = appState.client else { return }
             do {
                 try await client.updateConversation(id: conversation.id, status: next)
-                liveConversation = try await client.conversation(id: conversation.id)
+                await refreshConversation()
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
                 appState.handleUnauthorized(error)
@@ -1309,43 +1418,33 @@ private struct ChatView: View {
                 visitorIsTyping = false
             }
         case "new_message":
-            let needsInitialReload = isLoading && messages.isEmpty
+            let needsInitialReload = !hasLoadedInitialMessages
             messageLoadSequence += 1
             if let message = event.message {
-                if message.sender == "agent",
-                   let pendingIndex = messages.firstIndex(where: {
-                       $0.isPending && $0.type == message.type && $0.content == message.content
-                   }) {
-                    messages.remove(at: pendingIndex)
+                if message.sender == "agent" {
+                    messages.removeAll { $0.id == ChatMessageReconciliation.localID(for: message.id) }
                 }
                 if !messages.contains(where: { $0.id == message.id }) {
                     messages.append(message)
-                    if message.sender == "visitor", isReviewingMessageHistory {
-                        pendingNewMessageCount += 1
+                    if message.sender == "visitor" {
+                        visitorIsTyping = false
+                        typingHideTask?.cancel()
+                        scrollState.receivedVisitorMessages([message.id])
                     }
                 }
                 messages = deduplicatedMessages(messages)
             }
             Task {
-                guard let client = appState.client else { return }
                 if needsInitialReload {
                     await loadMessages(showError: false)
                 }
-                if !isReviewingMessageHistory {
-                    markConversationReadIfNeeded()
-                } else if let updated = try? await client.conversation(id: conversation.id) {
-                    liveConversation = updated
-                }
+                await refreshConversation()
             }
         case "message_recalled":
             messageLoadSequence += 1
             Task { await loadMessages(showError: false) }
         case "conversation_updated":
-            Task {
-                guard let client = appState.client,
-                      let updated = try? await client.conversation(id: conversation.id) else { return }
-                liveConversation = updated
-            }
+            Task { await refreshConversation() }
         case "conversation_deleted":
             dismiss()
         default:
@@ -1364,24 +1463,22 @@ private struct ChatView: View {
 
     private func refreshOtherUnreadCount() async {
         guard let client = appState.client else { return }
+        unreadLoadSequence += 1
+        let sequence = unreadLoadSequence
         do {
             let allConversations = try await client.conversations()
+            guard !Task.isCancelled, sequence == unreadLoadSequence else { return }
             otherUnreadCount = allConversations
                 .filter { $0.id != conversation.id }
                 .reduce(0) { $0 + max(0, $1.unreadCount) }
         } catch {
+            guard !Task.isCancelled, sequence == unreadLoadSequence else { return }
             appState.handleUnauthorized(error)
         }
     }
 
     private func deduplicatedMessages(_ source: [ChatMessage]) -> [ChatMessage] {
-        var seen = Set<String>()
-        return source
-            .sorted { lhs, rhs in
-                if lhs.createdAt == rhs.createdAt { return lhs.id < rhs.id }
-                return lhs.createdAt < rhs.createdAt
-            }
-            .filter { seen.insert($0.id).inserted }
+        ChatMessageReconciliation.deduplicate(source)
     }
 
     private func receiptState(for message: ChatMessage) -> MessageReceipt? {
@@ -1739,6 +1836,7 @@ private struct MessageBubble: View {
     let onQuote: () -> Void
     let onSelectText: () -> Void
     let onRecall: () -> Void
+    let onPresentationChanged: (Bool) -> Void
     @State private var showFullText = false
 
     private var isLongText: Bool {
@@ -1839,7 +1937,7 @@ private struct MessageBubble: View {
                         Label("选择部分文字", systemImage: "text.cursor")
                     }
                 }
-                if message.isAgent && !message.isRecalled {
+                if message.isAgent && !message.isRecalled && !message.isPending {
                     Button(role: .destructive, action: onRecall) {
                         Label("撤回消息", systemImage: "arrow.uturn.backward")
                     }
@@ -1854,6 +1952,10 @@ private struct MessageBubble: View {
                 )
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+            }
+            .onChange(of: showFullText) { onPresentationChanged($0) }
+            .onDisappear {
+                if showFullText { onPresentationChanged(false) }
             }
             .opacity(message.isPending ? 0.65 : 1)
             if !message.isAgent { Spacer(minLength: 48) }
