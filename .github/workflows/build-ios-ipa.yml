@@ -16,8 +16,10 @@ jobs:
           node --check server/db.js
           node --check server/public/widget.js
           node --check admin/app.js
-          cd server
-          npm audit --omit=dev
+
+      - name: Audit server dependencies
+        working-directory: server
+        run: npm audit --omit=dev
 
       - name: Check iOS interaction logic
         run: |
