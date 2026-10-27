@@ -42,6 +42,13 @@ struct APIClient {
         return try await request(path: "/api/conversations", queryItems: query)
     }
 
+    func inboxSnapshot() async throws -> InboxSnapshot {
+        let (data, response) = try await rawResponse(path: "/api/conversations")
+        let rows = try decoder.decode([Conversation].self, from: data)
+        let cursor = response.value(forHTTPHeaderField: "X-Chat-Event-ID").flatMap(Int64.init)
+        return InboxSnapshot(conversations: rows, eventID: cursor)
+    }
+
     func conversation(id: String) async throws -> Conversation {
         try await request(path: "/api/conversations/\(escaped(id))")
     }
@@ -50,10 +57,12 @@ struct APIClient {
         try await request(path: "/api/conversations/\(escaped(conversationId))/messages")
     }
 
-    func markRead(conversationId: String) async throws {
+    func markRead(conversationId: String, throughMessageID: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["throughMessageId": throughMessageID])
         let _: APIStatus = try await request(
             path: "/api/conversations/\(escaped(conversationId))/read",
-            method: "POST"
+            method: "POST",
+            body: body
         )
     }
 
@@ -313,6 +322,21 @@ struct APIClient {
         contentType: String = "application/json",
         timeout: TimeInterval = 30
     ) async throws -> Data {
+        let (data, _) = try await rawResponse(
+            path: path, method: method, queryItems: queryItems, body: body,
+            contentType: contentType, timeout: timeout
+        )
+        return data
+    }
+
+    private func rawResponse(
+        path: String,
+        method: String = "GET",
+        queryItems: [URLQueryItem] = [],
+        body: Data? = nil,
+        contentType: String = "application/json",
+        timeout: TimeInterval = 30
+    ) async throws -> (Data, HTTPURLResponse) {
         guard let url = makeURL(path: path, queryItems: queryItems) else { throw AppClientError.invalidServer }
 
         var request = URLRequest(url: url, timeoutInterval: timeout)
@@ -332,7 +356,7 @@ struct APIClient {
             let message = (payload?["error"] as? String) ?? "请求失败（\(http.statusCode)）"
             throw AppClientError.server(http.statusCode, message)
         }
-        return data
+        return (data, http)
     }
 
     private func escaped(_ value: String) -> String {

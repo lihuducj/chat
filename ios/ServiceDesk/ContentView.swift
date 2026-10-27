@@ -3,7 +3,6 @@ import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
 import Combine
-import UserNotifications
 import ImageIO
 import VisionKit
 #if canImport(Translation)
@@ -80,7 +79,7 @@ private struct ServerSetupView: View {
                 Spacer()
             }
             .padding(28)
-            .navigationTitle("客服台")
+            .navigationTitle("Chat")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -152,7 +151,7 @@ private struct LoginView: View {
                 Spacer()
             }
             .padding(28)
-            .navigationTitle(appState.serverURL?.host ?? "客服台")
+            .navigationTitle(appState.serverURL?.host ?? "Chat")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -184,7 +183,7 @@ private enum InboxFilter: String, CaseIterable, Identifiable {
 private struct ConversationListView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.scenePhase) private var scenePhase
-    @State private var conversations: [Conversation] = []
+    @State private var searchResults: [Conversation] = []
     @State private var search = ""
     @State private var isLoading = true
     @State private var errorMessage: String?
@@ -194,8 +193,14 @@ private struct ConversationListView: View {
     @State private var eventRefreshTask: Task<Void, Never>?
     @State private var loadSequence = 0
     @State private var navigationPath: [Conversation] = []
-    @State private var hasLoadedConversationBaseline = false
-    @State private var seenConversationActivity: [String: Int64] = [:]
+    private var conversations: [Conversation] {
+        guard !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return appState.inbox.conversations
+        }
+        let current = Dictionary(appState.inbox.conversations.map { ($0.id, $0) },
+                                 uniquingKeysWith: { _, new in new })
+        return searchResults.map { current[$0.id] ?? $0 }
+    }
 
     private var displayedConversations: [Conversation] {
         conversations
@@ -256,7 +261,7 @@ private struct ConversationListView: View {
                 }
             }
             .overlay(alignment: .bottom) {
-                if let errorMessage {
+                if let errorMessage = errorMessage ?? appState.inboxError {
                     Text(errorMessage)
                         .font(.caption)
                         .padding(.horizontal, 12)
@@ -265,7 +270,7 @@ private struct ConversationListView: View {
                         .padding()
                 }
             }
-            .navigationTitle("客服台")
+            .navigationTitle("Chat")
             .navigationDestination(for: Conversation.self) { conversation in
                 ChatView(conversation: conversation)
                     .id(conversation.id)
@@ -288,7 +293,16 @@ private struct ConversationListView: View {
                         Circle()
                             .fill(appState.isRealtimeConnected ? Color.green : Color.orange)
                             .frame(width: 8, height: 8)
-                        Text("客服台").font(.headline)
+                        Text("Chat").font(.headline)
+                        if appState.inbox.unreadCount > 0 {
+                            Text(appState.inbox.unreadCount > 99 ? "99+" : "\(appState.inbox.unreadCount)")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(.red, in: Capsule())
+                                .accessibilityLabel("\(appState.inbox.unreadCount) 条未读消息")
+                        }
                     }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -318,7 +332,7 @@ private struct ConversationListView: View {
             }
             .onReceive(appState.$lastEvent.compactMap { $0 }) { event in
                 guard ["new_message", "conversation_updated", "conversation_deleted", "message_recalled"].contains(event.type) else { return }
-                scheduleEventRefresh()
+                if !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { scheduleEventRefresh() }
             }
             .task(id: "\(scenePhase)-\(search)") {
                 guard scenePhase == .active else { return }
@@ -327,8 +341,9 @@ private struct ConversationListView: View {
                 }
                 guard !Task.isCancelled else { return }
                 await load(showSpinner: conversations.isEmpty)
+                guard !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                 while !Task.isCancelled {
-                    // SSE 是主通道；4秒轮询只做轻量对账，防止 iOS/反向代理偶发吞掉长连接事件。
+                    // Full inbox reconciliation lives in AppState, including while searching.
                     let delay: UInt64 = appState.isRealtimeConnected ? 4_000_000_000 : 3_000_000_000
                     try? await Task.sleep(nanoseconds: delay)
                     guard !Task.isCancelled else { break }
@@ -373,56 +388,22 @@ private struct ConversationListView: View {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
         if showSpinner { isLoading = true }
         defer { if sequence == loadSequence { isLoading = false } }
+        if query.isEmpty {
+            await appState.refreshInbox()
+            guard !Task.isCancelled, sequence == loadSequence else { return }
+            errorMessage = nil
+            return
+        }
         do {
             let result = try await client.conversations(search: query)
             guard !Task.isCancelled, sequence == loadSequence,
                   query == search.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
-            if query.isEmpty {
-                if hasLoadedConversationBaseline {
-                    for conversation in result where conversation.unreadCount > 0 {
-                        if let previousActivity = seenConversationActivity[conversation.id] {
-                            if conversation.lastMessageAt > previousActivity {
-                                appState.notifyForegroundConversationChange(conversation)
-                            }
-                        } else {
-                            appState.notifyForegroundConversationChange(conversation)
-                        }
-                    }
-                }
-                seenConversationActivity = Dictionary(
-                    uniqueKeysWithValues: result.map { ($0.id, $0.lastMessageAt) }
-                )
-                hasLoadedConversationBaseline = true
-            }
-            conversations = result
-            if query.isEmpty {
-                syncAppBadge(result.reduce(0) { $0 + $1.unreadCount })
-            }
+            searchResults = result
             errorMessage = nil
         } catch {
             guard !Task.isCancelled, sequence == loadSequence else { return }
             appState.handleUnauthorized(error)
             errorMessage = error.localizedDescription
-        }
-    }
-
-    private func syncAppBadge(_ unreadCount: Int) {
-        let center = UNUserNotificationCenter.current()
-        let applyBadge = {
-            center.setBadgeCount(max(0, unreadCount)) { _ in }
-        }
-
-        center.getNotificationSettings { settings in
-            switch settings.authorizationStatus {
-            case .notDetermined:
-                center.requestAuthorization(options: [.badge]) { granted, _ in
-                    if granted { applyBadge() }
-                }
-            case .authorized, .provisional, .ephemeral:
-                if settings.badgeSetting == .enabled { applyBadge() }
-            default:
-                break
-            }
         }
     }
 
@@ -432,7 +413,8 @@ private struct ConversationListView: View {
             do {
                 try await client.deleteConversation(id: conversation.id)
                 loadSequence += 1
-                conversations.removeAll { $0.id == conversation.id }
+                appState.removeConversationFromInbox(conversation.id)
+                searchResults.removeAll { $0.id == conversation.id }
                 await load(showSpinner: false)
             } catch {
                 appState.handleUnauthorized(error)
@@ -456,8 +438,9 @@ private struct ConversationListView: View {
     }
 
     private func scheduleEventRefresh() {
-        eventRefreshTask?.cancel()
+        guard eventRefreshTask == nil else { return }
         eventRefreshTask = Task {
+            defer { eventRefreshTask = nil }
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard !Task.isCancelled else { return }
             await load(showSpinner: false)
@@ -566,11 +549,8 @@ private struct ChatView: View {
     @State private var previewImageURL: URL?
     @State private var typingTask: Task<Void, Never>?
     @State private var typingHideTask: Task<Void, Never>?
-    @State private var unreadRefreshTask: Task<Void, Never>?
-    @State private var otherUnreadCount = 0
     @State private var messageLoadSequence = 0
     @State private var conversationLoadSequence = 0
-    @State private var unreadLoadSequence = 0
     @State private var scrollState = ChatScrollState()
     @State private var scrollTask: Task<Void, Never>?
     @State private var readTask: Task<Void, Never>?
@@ -584,6 +564,10 @@ private struct ChatView: View {
 
     private let chatBottomID = "chat-bottom-anchor"
     private let timelineSpace = "chat-timeline-viewport"
+
+    private var otherUnreadCount: Int {
+        appState.inbox.unreadCount(excluding: conversation.id)
+    }
 
     private var canReadConversation: Bool {
         isChatVisible && scenePhase == .active
@@ -860,13 +844,11 @@ private struct ChatView: View {
             isChatVisible = false
             messageLoadSequence += 1
             conversationLoadSequence += 1
-            unreadLoadSequence += 1
             scrollTask?.cancel()
             readTask?.cancel()
             typingTask?.cancel()
             typingTask = nil
             typingHideTask?.cancel()
-            unreadRefreshTask?.cancel()
         }
         .onAppear {
             isChatVisible = true
@@ -877,13 +859,11 @@ private struct ChatView: View {
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             await loadMessages()
-            await refreshOtherUnreadCount()
             while !Task.isCancelled {
                 let delay: UInt64 = appState.isRealtimeConnected ? 5_000_000_000 : 3_000_000_000
                 try? await Task.sleep(nanoseconds: delay)
                 guard !Task.isCancelled else { break }
                 await loadMessages(showError: false)
-                await refreshOtherUnreadCount()
             }
         }
     }
@@ -1084,8 +1064,9 @@ private struct ChatView: View {
                           layoutIsCurrent: timelineLayout?.lastMessageID == messages.last?.id
                       ),
                       messages.last(where: { $0.sender == "visitor" })?.id == newestMessageID else { return }
-                try await client.markRead(conversationId: conversation.id)
+                try await client.markRead(conversationId: conversation.id, throughMessageID: newestMessageID)
                 lastMarkedReadMessageID = newestMessageID
+                appState.requestInboxRefresh()
             } catch {
                 guard !Task.isCancelled else { return }
                 appState.handleUnauthorized(error)
@@ -1126,8 +1107,8 @@ private struct ChatView: View {
         guard !isSending, !text.isEmpty, let client = appState.client else { return }
         let quote = quotedText
         let outgoingText = quote.map { "「\($0)」\n\(text)" } ?? text
-        guard outgoingText.utf16.count <= 10_000 else {
-            errorMessage = "消息连同引用不能超过 10000 个字符，请分段发送。"
+        guard outgoingText.utf16.count <= 100_000 else {
+            errorMessage = "消息连同引用不能超过 100000 个字符，请分段发送。"
             return
         }
         let clientMessageID = "ios-\(UUID().uuidString)"
@@ -1404,9 +1385,6 @@ private struct ChatView: View {
     }
 
     private func handleRealtimeEvent(_ event: NativeEvent) {
-        if ["new_message", "conversation_updated", "conversation_deleted"].contains(event.type) {
-            scheduleOtherUnreadRefresh()
-        }
         guard event.conversationId == conversation.id else { return }
         switch event.type {
         case "visitor_typing":
@@ -1449,31 +1427,6 @@ private struct ChatView: View {
             dismiss()
         default:
             break
-        }
-    }
-
-    private func scheduleOtherUnreadRefresh() {
-        unreadRefreshTask?.cancel()
-        unreadRefreshTask = Task {
-            try? await Task.sleep(nanoseconds: 220_000_000)
-            guard !Task.isCancelled else { return }
-            await refreshOtherUnreadCount()
-        }
-    }
-
-    private func refreshOtherUnreadCount() async {
-        guard let client = appState.client else { return }
-        unreadLoadSequence += 1
-        let sequence = unreadLoadSequence
-        do {
-            let allConversations = try await client.conversations()
-            guard !Task.isCancelled, sequence == unreadLoadSequence else { return }
-            otherUnreadCount = allConversations
-                .filter { $0.id != conversation.id }
-                .reduce(0) { $0 + max(0, $1.unreadCount) }
-        } catch {
-            guard !Task.isCancelled, sequence == unreadLoadSequence else { return }
-            appState.handleUnauthorized(error)
         }
     }
 

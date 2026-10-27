@@ -4,20 +4,25 @@ const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const cookie = require('cookie');
 const cookieParser = require('cookie-parser');
 const { nanoid } = require('nanoid');
 const fetch = require('node-fetch');
 const webpush = require('web-push');
 const http = require('http');
 const { Server } = require('socket.io');
+const { MAX_MESSAGE_BODY_BYTES, sanitizeMessagePayload } = require('./message-validation');
+const net = require('node:net');
+const { SlidingWindowLimiter } = require('./abuse-guard');
+const { IMAGE_EXTENSIONS, MAX_IMAGE_BYTES, cleanImage } = require('./image-upload');
+const abuseGuard = new SlidingWindowLimiter();
+setInterval(() => abuseGuard.sweep(), 60000).unref();
 
 const db = require('./db');
 
 const app = express();
-// 线上只有一层 Nginx/宝塔反代。限定一层能让 req.ip 取到真实访客 IP，
-// 又不会像 `true` 那样信任客户端自己伪造的整条 X-Forwarded-For。
-app.set('trust proxy', 1);
+// Only the local reverse proxy is trusted. ESA client IP requires a separate
+// trusted-edge configuration in Nginx; never trust arbitrary internet headers.
+app.set('trust proxy', 'loopback');
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -28,7 +33,7 @@ app.use((req, res, next) => {
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },
-  maxHttpBufferSize: 64 * 1024,
+  maxHttpBufferSize: MAX_MESSAGE_BODY_BYTES,
   perMessageDeflate: false
 });
 
@@ -42,6 +47,9 @@ const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+// Untrusted upload bytes must not be reachable through /uploads while decoding.
+const PRIVATE_UPLOAD_DIR = path.join(__dirname, '.upload-staging');
+fs.mkdirSync(PRIVATE_UPLOAD_DIR, { recursive: true, mode: 0o700 });
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   // VAPID的subject必须是合法的 mailto: 或 https:// 开头的URL，格式不对的话，
@@ -94,7 +102,7 @@ app.use(cors({
   credentials: false,
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Visitor-Id', 'X-Visitor-Secret']
 }));
-app.use(express.json({ limit: '128kb' }));
+app.use(express.json({ limit: MAX_MESSAGE_BODY_BYTES }));
 app.use(cookieParser());
 // widget是嵌到别的网站里的单文件脚本，修复身份/安全问题后必须尽快让所有访客拿到
 // 新版本，不能被浏览器或中间CDN长期缓存旧逻辑。
@@ -116,7 +124,7 @@ function createSession() {
   return token;
 }
 function isValidSession(token) {
-  if (!token) return false;
+  if (typeof token !== 'string' || token.length !== 40) return false;
   const row = db.prepare('SELECT expires_at FROM sessions WHERE token = ?').get(token);
   if (!row) return false;
   if (Date.now() > row.expires_at) {
@@ -127,8 +135,23 @@ function isValidSession(token) {
   db.prepare('UPDATE sessions SET expires_at = ? WHERE token = ?').run(Date.now() + SESSION_TTL, token);
   return true;
 }
+function isSessionActive(token) {
+  if (typeof token !== 'string' || token.length !== 40) return false;
+  const row = db.prepare('SELECT expires_at FROM sessions WHERE token = ?').get(token);
+  return Boolean(row && Date.now() < row.expires_at);
+}
 function deleteSession(token) {
+  if (typeof token !== 'string' || token.length !== 40) return;
   db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  // Revocation must also stop already established streams, not only new REST calls.
+  for (const socket of io.of('/').sockets.values()) {
+    if (socket.data.authToken === token) socket.disconnect(true);
+  }
+  for (const client of nativeEventClients) {
+    if (client.sessionToken !== token) continue;
+    nativeEventClients.delete(client);
+    client.end();
+  }
 }
 function getTokenFromReq(req) {
   const auth = req.headers.authorization || '';
@@ -136,18 +159,12 @@ function getTokenFromReq(req) {
   return req.cookies.ms_session || '';
 }
 const loginAttempts = new Map(); // ip -> { count, lockedUntil }
-const uploadAttempts = new Map(); // ip -> [timestamp, ...]
 
 // 定期清理这两个内存Map里的过期记录，服务长期运行也不会占用越来越多内存
 setInterval(() => {
   const now = Date.now();
   for (const [ip, rec] of loginAttempts) {
     if (rec.lockedUntil < now && rec.count === 0) loginAttempts.delete(ip);
-  }
-  for (const [ip, timestamps] of uploadAttempts) {
-    const recent = timestamps.filter((t) => now - t < 5 * 60 * 1000);
-    if (recent.length === 0) uploadAttempts.delete(ip);
-    else uploadAttempts.set(ip, recent);
   }
   // 推送日志只保留最近30天，避免无限增长
   try {
@@ -158,6 +175,7 @@ setInterval(() => {
 function requireAuth(req, res, next) {
   const token = getTokenFromReq(req);
   if (isValidSession(token)) {
+    res.setHeader('Cache-Control', 'private, no-store');
     return next();
   }
   return res.status(401).json({ error: 'unauthorized' });
@@ -168,11 +186,18 @@ function cleanText(value, maxLength) {
 }
 
 function socketClientIP(socket) {
+  const peer = String(socket.handshake.address || '').replace(/^::ffff:/, '');
+  if (!['127.0.0.1', '::1'].includes(peer)) return net.isIP(peer) ? peer : 'unknown';
   const headers = socket.handshake.headers || {};
   const forwardedParts = cleanText(headers['x-forwarded-for'], 500).split(',').map((part) => part.trim()).filter(Boolean);
   const forwarded = forwardedParts[forwardedParts.length - 1] || '';
   const realIP = cleanText(headers['x-real-ip'], 100);
-  return cleanText(realIP || forwarded || socket.handshake.address || '', 100);
+  return [realIP, forwarded, peer].find(value => net.isIP(value)) || 'unknown';
+}
+
+function securityEvent(reason, ip, visitorId) {
+  if (!abuseGuard.take('audit:' + reason + ':' + ip, 1, 10000)) return;
+  console.warn(JSON.stringify({ event: 'security', reason, ip, visitorId, at: Date.now() }));
 }
 
 function requestClientIP(req) {
@@ -198,6 +223,7 @@ function requireUploadIdentity(req, res, next) {
   const visitorSecret = req.get('X-Visitor-Secret') || '';
   if (hasValidVisitorIdentity(visitorId, visitorSecret)) {
     req.uploadActor = 'visitor';
+    req.uploadVisitorId = visitorId;
     return next();
   }
   return res.status(401).json({ error: '上传身份已失效，请刷新聊天窗口后重试' });
@@ -229,11 +255,20 @@ function emitNativeEvent(type, conversationId, extra = {}) {
     eventId: nativeEventSequence,
     ...extra
   };
+  if (conversationId && ['new_message', 'conversation_updated', 'message_recalled'].includes(type)) {
+    // Carry the preview and unread count so the app can render without another GET.
+    event.conversation = nativeConversationSnapshot(conversationId) || null;
+  }
   const payload = JSON.stringify(event);
   nativeEventHistory.push({ id: nativeEventSequence, payload });
   if (nativeEventHistory.length > NATIVE_EVENT_HISTORY_LIMIT) nativeEventHistory.shift();
   for (const client of nativeEventClients) {
     try {
+      if (!isSessionActive(client.sessionToken)) {
+        nativeEventClients.delete(client);
+        client.end();
+        continue;
+      }
       client.write(`data: ${payload}\n\n`);
     } catch (e) {
       nativeEventClients.delete(client);
@@ -241,7 +276,18 @@ function emitNativeEvent(type, conversationId, extra = {}) {
   }
 }
 
+function nativeConversationSnapshot(id) {
+  return db.prepare(`
+    SELECT c.*, v.name AS visitor_name, v.email AS visitor_email, v.ip AS visitor_ip, v.last_url,
+      (SELECT substr(content, 1, 500) FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS last_message,
+      (SELECT type FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS last_type,
+      (SELECT sender FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC, rowid DESC LIMIT 1) AS last_sender
+    FROM conversations c JOIN visitors v ON v.id = c.visitor_id WHERE c.id = ?
+  `).get(id);
+}
+
 app.get('/api/native/events', requireAuth, (req, res) => {
+  res.sessionToken = getTokenFromReq(req);
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -267,6 +313,11 @@ app.get('/api/native/events', requireAuth, (req, res) => {
   })}\n\n`);
 
   const heartbeat = setInterval(() => {
+    if (!isSessionActive(res.sessionToken)) {
+      nativeEventClients.delete(res);
+      res.end();
+      return;
+    }
     try { res.write(`data: ${JSON.stringify({ type: 'heartbeat', conversationId: null })}\n\n`); } catch (e) {}
   }, 15000);
 
@@ -324,8 +375,8 @@ app.get('/api/me', requireAuth, (req, res) => res.json({ ok: true }));
 // manifest 依据实际管理路径动态生成，放在静态目录挂载之前优先匹配
 app.get(`/${ADMIN_PATH}/manifest.json`, (req, res) => {
   res.json({
-    name: '客服台',
-    short_name: '客服台',
+    name: 'Chat',
+    short_name: 'Chat',
     start_url: `/${ADMIN_PATH}/index.html`,
     scope: `/`, // 故意放宽到整个域名（不只是/admin/），避免任何同源跳转(比如查看图片、下载附件)因为超出scope被iOS弹出到简化浏览器视图里
     display: 'standalone',
@@ -356,17 +407,19 @@ const ALLOWED_EXTENSIONS = new Set([
   '.zip', '.rar', '.7z' // 压缩包
 ]);
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  destination: (req, file, cb) => cb(null, PRIVATE_UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${nanoid()}${ext}`);
+    cb(null, `raw-${nanoid()}.tmp`);
   }
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  limits: { fileSize: MAX_IMAGE_BYTES, files: 1, fields: 4, parts: 5 },
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
+    if (req.uploadActor === 'visitor' && !IMAGE_EXTENSIONS.has(ext)) {
+      return cb(new Error('客户只能上传 JPG、PNG、WebP、GIF 图片'));
+    }
     if (!ALLOWED_EXTENSIONS.has(ext)) {
       return cb(new Error('不支持的文件类型'));
     }
@@ -374,34 +427,52 @@ const upload = multer({
   }
 });
 
+let activeUploads = 0;
 app.post('/api/upload', requireUploadIdentity, (req, res) => {
   const ip = requestClientIP(req);
-  const attemptKey = `${req.uploadActor || 'unknown'}:${ip}`;
+  const attemptKey = `upload:${req.uploadActor}:${req.uploadVisitorId || ip}`;
   const uploadLimit = req.uploadActor === 'agent' ? 60 : 12;
-  const now = Date.now();
-  const record = uploadAttempts.get(attemptKey) || [];
-  const recent = record.filter((t) => now - t < 5 * 60 * 1000);
-  if (recent.length >= uploadLimit) {
+  if (!abuseGuard.take(attemptKey, uploadLimit, 300000) ||
+      !abuseGuard.take('upload-ip:' + ip, 120, 300000)) {
+    securityEvent('upload_rate_limit', ip, req.uploadVisitorId);
     return res.status(429).json({ error: '上传太频繁，请稍后再试' });
   }
-  recent.push(now);
-  uploadAttempts.set(attemptKey, recent);
-
-  upload.single('file')(req, res, (err) => {
+  if (activeUploads >= 8) return res.status(503).json({ error: '上传繁忙，请稍后再试' });
+  activeUploads++;
+  upload.single('file')(req, res, async (err) => {
+    let cleaned;
+    let published;
+    let saved = false;
+    try {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(413).json({ error: '文件不能超过 20MB' });
       }
-      return res.status(400).json({ error: err.message === '不支持的文件类型' ? err.message : '上传失败' });
+      return res.status(400).json({ error: ['不支持的文件类型', '客户只能上传 JPG、PNG、WebP、GIF 图片'].includes(err.message) ? err.message : '上传失败' });
     }
     if (!req.file) return res.status(400).json({ error: 'no file' });
-    const isImage = /^image\//.test(req.file.mimetype);
-    res.json({
-      url: `/uploads/${req.file.filename}`,
-      name: req.file.originalname,
-      size: req.file.size,
-      type: isImage ? 'image' : 'file'
-    });
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const isImage = IMAGE_EXTENSIONS.has(ext);
+    if (isImage) cleaned = await cleanImage(req.file.path, PRIVATE_UPLOAD_DIR);
+    const filename = cleaned ? cleaned.filename : nanoid() + ext;
+    const name = path.basename(req.file.originalname, ext).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 180) + (cleaned ? '.' + cleaned.extension : ext);
+    const result = { url: '/uploads/' + filename, name, size: cleaned ? cleaned.size : req.file.size, type: isImage ? 'image' : 'file' };
+    if (req.aborted || res.destroyed) return;
+    published = path.join(UPLOAD_DIR, filename);
+    await fs.promises.rename(cleaned ? cleaned.path : req.file.path, published);
+    db.prepare('INSERT INTO attachment_uploads (url, actor, visitor_id, type, file_name, file_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(result.url, req.uploadActor, req.uploadVisitorId || null, result.type, result.name, result.size, Date.now());
+    saved = true;
+    res.json(result);
+    } catch (error) {
+      securityEvent('upload_rejected', ip, req.uploadVisitorId);
+      if (!res.headersSent && !res.destroyed) res.status(error.uploadStatus || 500).json({ error: error.uploadStatus ? error.message : '上传失败，请稍后重试' });
+    } finally {
+      for (const file of [req.file && req.file.path, cleaned && cleaned.path, !saved && published].filter(Boolean)) {
+        await fs.promises.unlink(file).catch(() => {});
+      }
+      activeUploads--;
+    }
   });
 });
 
@@ -668,6 +739,7 @@ app.get('/api/conversations', requireAuth, (req, res) => {
         JOIN visitors v ON v.id = c.visitor_id
         ORDER BY c.last_message_at DESC
       `).all();
+  res.setHeader('X-Chat-Event-ID', String(nativeEventSequence));
   res.json(rows);
 });
 
@@ -737,7 +809,19 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
 });
 
 app.post('/api/conversations/:id/read', requireAuth, (req, res) => {
-  const result = db.prepare('UPDATE conversations SET unread_count = 0 WHERE id = ? AND unread_count != 0').run(req.params.id);
+  const throughMessageId = req.body && req.body.throughMessageId;
+  let remaining = 0;
+  if (throughMessageId !== undefined) {
+    if (!isSafeId(throughMessageId)) return res.status(400).json({ error: 'invalid read position' });
+    const marker = db.prepare("SELECT rowid AS position FROM messages WHERE id = ? AND conversation_id = ? AND sender = 'visitor'")
+      .get(throughMessageId, req.params.id);
+    if (!marker) return res.status(400).json({ error: 'invalid read position' });
+    remaining = db.prepare("SELECT count(*) AS total FROM messages WHERE conversation_id = ? AND sender = 'visitor' AND rowid > ? AND COALESCE(recalled, 0) = 0")
+      .get(req.params.id, marker.position).total;
+  }
+  // Only acknowledge the displayed prefix; delayed reads cannot restore old unread.
+  const result = db.prepare('UPDATE conversations SET unread_count = MIN(unread_count, ?) WHERE id = ? AND unread_count > ?')
+    .run(remaining, req.params.id, remaining);
   if (result.changes) emitNativeEvent('conversation_updated', req.params.id);
   res.json({ ok: true });
 });
@@ -755,6 +839,7 @@ app.post('/api/conversations/:id/typing', requireAuth, (req, res) => {
 function createAgentMessage(conversationId, payload) {
   const clean = sanitizeMessagePayload(payload);
   if (!clean || !conversationId) return { error: 'invalid message', status: 400 };
+  if (clean.error) return { error: clean.error, code: clean.code, status: 400 };
 
   const conversation = db.prepare('SELECT id, visitor_id FROM conversations WHERE id = ?').get(conversationId);
   if (!conversation) return { error: 'conversation not found', status: 404 };
@@ -815,7 +900,7 @@ function recallAgentMessage(conversationId, messageId) {
 
 app.post('/api/conversations/:id/messages', requireAuth, (req, res) => {
   const result = createAgentMessage(req.params.id, req.body || {});
-  if (result.error) return res.status(result.status).json({ error: result.error });
+  if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
   res.json(result.message);
 });
 
@@ -935,7 +1020,7 @@ function isAnyAgentTrulyActive() {
   return false;
 }
 
-// 客服端连接需要携带有效token/cookie，握手阶段就拦截，未授权时客户端会收到真正的 connect_error 事件
+// 客服端必须在 Socket.IO namespace 鉴权包中携带有效 token；URL 和 Cookie 不可用于客服连接。
 function socketHandshakeIdentity(socket) {
   return {
     ...(socket.handshake.query || {}),
@@ -944,14 +1029,23 @@ function socketHandshakeIdentity(socket) {
 }
 
 io.use((socket, next) => {
-  const { role, token } = socketHandshakeIdentity(socket);
+  const { role } = socketHandshakeIdentity(socket);
+  if (role !== 'agent' && role !== 'visitor') return next(new Error('unauthorized'));
   if (role === 'agent') {
-    const cookies = cookie.parse(socket.handshake.headers.cookie || '');
-    const authToken = token || cookies.ms_session;
+    // Namespace auth is transmitted in the Socket.IO packet, never the URL or a browser cookie.
+    const authToken = socket.handshake.auth && socket.handshake.auth.token;
     if (!isValidSession(authToken)) return next(new Error('unauthorized'));
+    socket.data.authToken = authToken;
+  } else if (!abuseGuard.take('visitor-connect:' + socketClientIP(socket), 120, 60000)) {
+    return next(new Error('连接太频繁，请稍后重试'));
   }
   next();
 });
+setInterval(() => {
+  for (const socket of io.of('/').sockets.values()) {
+    if (socket.data.authToken && !isSessionActive(socket.data.authToken)) socket.disconnect(true);
+  }
+}, 15000).unref();
 
 // 没填邮箱的访客给一个随机编号(chat123456)，比"访客"这种千篇一律的标签好辨认
 function genVisitorLabel() {
@@ -999,34 +1093,14 @@ const ensureConversation = db.transaction((vId, requestedConversationId) => {
   }
 });
 
-const MAX_TEXT_LENGTH = 10000;
-const UPLOAD_PATH_RE = /^\/uploads\/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10}$/;
-
-// 服务端二次校验消息内容，不能只信任客户端传来的数据——
-// 万一有人绕过widget界面直接拿socket.io-client连过来伪造消息，这里能兜住
-function sanitizeMessagePayload(payload) {
-  let { type, content, fileName, fileSize } = payload || {};
-  content = typeof content === 'string' ? content : '';
-
-  if (type === 'image' || type === 'file') {
-    // image/file类型的content必须是我们自己上传接口生成的真实路径，不接受任意字符串
-    if (!UPLOAD_PATH_RE.test(content)) return null;
-    if (typeof fileName === 'string') fileName = fileName.slice(0, 200);
-    if (typeof fileSize !== 'number') fileSize = null;
-  } else {
-    type = 'text';
-    content = content.trim().slice(0, MAX_TEXT_LENGTH);
-    if (!content) return null;
-    fileName = null;
-    fileSize = null;
-  }
-  return { type, content, fileName: fileName || null, fileSize: fileSize || null };
-}
-
 io.on('connection', (socket) => {
   const { role, visitorId, visitorSecret, conversationId, name, email, url } = socketHandshakeIdentity(socket);
 
   if (role === 'agent') {
+    socket.use((packet, next) => {
+      if (isValidSession(socket.data.authToken)) return next();
+      socket.disconnect(true);
+    });
     onlineAgents.add(socket.id);
     activeAgents.add(socket.id); // 连上时先默认是前台可见状态
     agentLastSeen.set(socket.id, Date.now());
@@ -1061,7 +1135,7 @@ io.on('connection', (socket) => {
         const result = createAgentMessage(conversationId, payload || {});
         if (typeof acknowledge === 'function') {
           acknowledge(result.error
-            ? { ok: false, error: result.error }
+            ? { ok: false, error: result.error, code: result.code }
             : { ok: true, messageId: result.message.id });
         }
       } catch (error) {
@@ -1087,18 +1161,17 @@ io.on('connection', (socket) => {
     const now = Date.now();
 
     let existingVisitor = db.prepare('SELECT * FROM visitors WHERE id = ?').get(vId);
-    // 已启用 secret 的访客必须同时匹配；不匹配时创建全新匿名身份，绝不返回原历史。
-    // 老数据没有 secret，第一次升级连接时生成并回传一次，之后即进入双重校验。
-    if (existingVisitor && existingVisitor.visitor_secret && existingVisitor.visitor_secret !== vSecret) {
+    // An identifier alone is never proof of ownership, including legacy rows.
+    // Never assign a new secret to an existing unverified visitor.
+    if (!existingVisitor || !existingVisitor.visitor_secret || existingVisitor.visitor_secret !== vSecret) {
+      if (existingVisitor) securityEvent('visitor_identity_rejected', socketClientIP(socket), vId);
+      if (!abuseGuard.take('visitor-new:' + socketClientIP(socket), 60, 60000)) {
+        socket.disconnect(true);
+        return;
+      }
       vId = nanoid();
       vSecret = nanoid(40);
       existingVisitor = null;
-    } else if (existingVisitor && !existingVisitor.visitor_secret) {
-      vSecret = nanoid(40);
-      db.prepare('UPDATE visitors SET visitor_secret = ? WHERE id = ?').run(vSecret, vId);
-      existingVisitor.visitor_secret = vSecret;
-    } else if (!existingVisitor && !vSecret) {
-      vSecret = nanoid(40);
     }
 
     const visitorIP = socketClientIP(socket) || (existingVisitor && existingVisitor.ip) || '';
@@ -1156,6 +1229,7 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
 
     socket.on('visitor_info', (payload) => {
+      if (!abuseGuard.take('profile:' + vId, 6, 60000)) return;
       const vName = cleanText(payload && payload.name, 80);
       const vEmail = cleanText(payload && payload.email, 254);
       if (!vName && !vEmail) return;
@@ -1167,17 +1241,20 @@ io.on('connection', (socket) => {
     });
 
     socket.on('visitor_typing', () => {
+      if (!abuseGuard.take('typing:' + vId, 1, 1000)) return;
       io.to('agents').emit('visitor_typing', { conversationId: convId });
       emitNativeEvent('visitor_typing', convId);
     });
 
     // 访客客户端确认收到了消息（送达），或者确认真的打开窗口看了（已读）
     socket.on('visitor_delivered', () => {
+      if (!abuseGuard.take('delivered:' + vId, 2, 1000)) return;
       db.prepare('UPDATE conversations SET visitor_delivered_at = ? WHERE id = ?').run(Date.now(), convId);
       io.to('agents').emit('conversation_updated', { conversationId: convId });
       emitNativeEvent('conversation_updated', convId);
     });
     socket.on('visitor_read', () => {
+      if (!abuseGuard.take('read:' + vId, 2, 1000)) return;
       const now = Date.now();
       db.prepare('UPDATE conversations SET visitor_delivered_at = MAX(visitor_delivered_at, ?), visitor_read_at = ? WHERE id = ?')
         .run(now, now, convId);
@@ -1185,24 +1262,40 @@ io.on('connection', (socket) => {
       emitNativeEvent('conversation_updated', convId);
     });
 
-    let msgTimestamps = [];
     socket.on('visitor_message', (payload, acknowledge) => {
       try {
-      // 简单防刷：10秒内超过15条消息就先丢弃，防止恶意脚本刷爆数据库和Bark推送
-      const now2 = Date.now();
-      msgTimestamps = msgTimestamps.filter((t) => now2 - t < 10000);
-      if (msgTimestamps.length >= 15) {
-        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: '发送太频繁，请稍后再试' });
+      const reject = (error, code) => {
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error, code, retryable: false });
+      };
+      if (!abuseGuard.take('message-attempt:' + vId, 20, 10000) ||
+          !abuseGuard.take('message-ip:' + visitorIP, 600, 60000)) {
+        reject('发送太频繁，请稍后再试', 'RATE_LIMITED');
         return;
       }
-      msgTimestamps.push(now2);
 
       const clean = sanitizeMessagePayload(payload);
       if (!clean) {
-        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: '消息内容无效' });
+        reject('消息内容无效', 'INVALID_MESSAGE');
         return;
       }
-      activateConversation();
+      if (clean.error) {
+        reject(clean.error, clean.code);
+        return;
+      }
+      if (clean.type === 'file') {
+        reject('客户只能上传图片', 'IMAGE_ONLY');
+        return;
+      }
+      if (clean.type === 'image') {
+        const attachment = db.prepare("SELECT * FROM attachment_uploads WHERE url = ? AND actor = 'visitor' AND visitor_id = ? AND type = 'image'").get(clean.content, vId);
+        if (!attachment || !fs.existsSync(path.join(UPLOAD_DIR, path.basename(clean.content)))) {
+          securityEvent('attachment_ownership_rejected', visitorIP, vId);
+          reject('图片无效或不属于当前访客，请重新上传', 'INVALID_ATTACHMENT');
+          return;
+        }
+        clean.fileName = attachment.file_name;
+        clean.fileSize = attachment.file_size;
+      }
       const requestedMessageId = isSafeId(payload && payload.clientMessageId) ? payload.clientMessageId : '';
       if (requestedMessageId) {
         const existing = db.prepare('SELECT * FROM messages WHERE id = ?').get(requestedMessageId);
@@ -1211,11 +1304,20 @@ io.on('connection', (socket) => {
             socket.emit('new_message', existing);
             if (typeof acknowledge === 'function') acknowledge({ ok: true, messageId: existing.id });
           } else if (typeof acknowledge === 'function') {
-            acknowledge({ ok: false, error: '消息ID冲突' });
+            reject('消息ID冲突', 'MESSAGE_ID_CONFLICT');
           }
           return;
         }
       }
+      // Shared by every connection of this identity; reconnecting cannot reset it.
+      if (!abuseGuard.take('messages-short:' + vId, 8, 10000) ||
+          !abuseGuard.take('messages-minute:' + vId, 30, 60000) ||
+          !abuseGuard.take('message-chars:' + vId, 500000, 60000, clean.content.length)) {
+        securityEvent('message_rate_limit', visitorIP, vId);
+        reject('发送太频繁，请稍后再试', 'RATE_LIMITED');
+        return;
+      }
+      activateConversation();
       const msg = {
         id: requestedMessageId || nanoid(),
         conversation_id: convId,
@@ -1249,4 +1351,4 @@ io.on('connection', (socket) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Server running on :${PORT}`));
+server.listen(PORT, '127.0.0.1', () => console.log(`Server running on 127.0.0.1:${PORT}`));

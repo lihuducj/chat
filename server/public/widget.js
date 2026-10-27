@@ -1,4 +1,5 @@
 (function () {
+  var MAX_TEXT_LENGTH = 100000;
   // 防止同一页面重复加载这段脚本（比如公共头部+页脚都不小心贴了一份）
   if (window.__MS_WIDGET_LOADED__) return;
   window.__MS_WIDGET_LOADED__ = true;
@@ -106,7 +107,7 @@
 
   // 首次访问时先由浏览器同步生成高强度随机身份，再发起网络连接。这样Socket.IO
   // 即使在session_info返回前遇到断网重连，也不会再次拿空身份让服务器创建新访客。
-  // 老版本已经有visitorId但还没有secret时保留原ID，由服务器完成一次性安全升级。
+  // 老版本只留下 visitorId、没有 secret 时，服务端会分配新的安全身份。
   if (!isSafeIdentityPart(stored.visitorId)) {
     var initialVisitorId = randomHex(16);
     var initialVisitorSecret = randomHex(32);
@@ -168,7 +169,7 @@
     #ms-collapse-btn:hover { background: rgba(255,255,255,.32); }
     #ms-intro { padding: 12px 18px; font-size: 13px; line-height: 1.5; color: var(--ms-muted);
       background: var(--ms-msg-bg); border-bottom: 1px solid var(--ms-bubble-border); flex-shrink: 0; }
-    #ms-messages { flex: 1; overflow-y: auto; padding: 12px; background: var(--ms-msg-bg); position: relative; }
+    #ms-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; background: var(--ms-msg-bg); position: relative; }
     .ms-row { display: flex; margin-bottom: 10px; }
     .ms-row.me { justify-content: flex-end; }
     .ms-col { display: flex; flex-direction: column; max-width: 78%; }
@@ -218,10 +219,12 @@
     .ms-gate-submit { background: ${PRIMARY}; color: #fff; }
     .ms-gate-skip { background: var(--ms-msg-bg); color: var(--ms-muted); border: 1px solid var(--ms-bubble-border) !important; }
     .ms-gate-err { color: #F87171; font-size: 11px; margin-top: -6px; margin-bottom: 8px; text-align: left; }
+    .ms-email-prompt .ms-bubble { font-size: 14px; }
+    .ms-email-action { display: block; margin-top: 6px; padding: 6px 0; background: none; border: none;
+      color: ${PRIMARY}; font: inherit; font-weight: 600; text-decoration: underline; cursor: pointer; }
     #ms-typing { padding: 4px 12px; font-size: 12px; color: var(--ms-muted); display: none; background: var(--ms-msg-bg); }
     #ms-typing.show { display: block; }
-    #ms-menu-view { position: absolute; inset: 0; background: var(--ms-msg-bg); overflow-y: auto;
-      padding: 14px; display: none; flex-direction: column; gap: 10px; z-index: 2; }
+    #ms-menu-view { padding: 2px 0 14px; display: none; flex-direction: column; gap: 10px; }
     #ms-menu-view.show { display: flex; }
     .ms-menu-back { align-self: flex-start; background: none; border: none; color: ${PRIMARY};
       font-size: 14px; font-weight: 600; cursor: pointer; padding: 4px 2px; margin-bottom: 2px; }
@@ -267,11 +270,11 @@
     <div id="ms-messages"><div id="ms-menu-view"></div></div>
     <div id="ms-typing">客服正在输入…</div>
     <div id="ms-inputbar">
-      <button id="ms-attach" title="发送文件"><svg viewBox="0 0 24 24"><path d="M16.5 6.5l-8 8a3 3 0 104.24 4.24l7-7a1 1 0 111.42 1.42l-7 7a5 5 0 11-7.08-7.08l8-8a3 3 0 114.24 4.24l-7.5 7.5a1 1 0 01-1.42-1.42l7-7z"/></svg></button>
+      <button id="ms-attach" title="发送图片" aria-label="发送图片"><svg viewBox="0 0 24 24"><path d="M4 3h16a1 1 0 011 1v16a1 1 0 01-1 1H4a1 1 0 01-1-1V4a1 1 0 011-1zm1 2v14h14V5H5zm2 12l4-5 3 3 2-2 2 4H7zm1-9a2 2 0 114 0 2 2 0 01-4 0z"/></svg></button>
       <button id="ms-emoji" title="表情">😊</button>
       <input id="ms-input" placeholder="输入消息..." />
       <button id="ms-send"><svg viewBox="0 0 24 24"><path d="M3 20l18-8L3 4v6l12 2-12 2z"/></svg></button>
-      <input id="ms-file" type="file" style="display:none" />
+      <input id="ms-file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" style="display:none" />
       <div id="ms-emoji-popup"></div>
     </div>
   `;
@@ -291,7 +294,36 @@
   // 注意：跳过只是这一次会话不再问，不会永久记住——只要客户没有真正留下邮箱，
   // 下次重新打开页面（哪怕就是刷新一下）还是会再问一次，直到留了邮箱为止 ----------
   var gateShownThisSession = false; // 只防止同一次打开页面内重复弹，不代表"以后都不弹了"
-  function insertGateCard(onDone) {
+  var emailPromptEl = null;
+  var emailPromptAfterMessageId = '';
+
+  // 这是客户本地的操作提示，不发送成聊天消息，避免通知客服或增加未读数。
+  function ensureEmailPrompt() {
+    if (stored.email) return false;
+    var created = !emailPromptEl;
+    if (created) {
+      emailPromptEl = document.createElement('div');
+      emailPromptEl.className = 'ms-row ms-email-prompt';
+      emailPromptEl.setAttribute('role', 'note');
+      emailPromptEl.innerHTML = '<div class="ms-col"><div class="ms-bubble">您可以稍后补充邮箱，方便客服联系您。' +
+        '<button class="ms-email-action" type="button">点击设置邮箱</button></div></div>';
+      emailPromptEl.querySelector('button').onclick = function () { insertGateCard(); };
+    }
+    positionEmailPrompt();
+    return created;
+  }
+
+  function positionEmailPrompt() {
+    if (!emailPromptEl) return;
+    var rows = Array.prototype.slice.call(messagesEl.querySelectorAll('.ms-row[data-msg-id]'));
+    var anchor = rows.find(function (row) { return row.getAttribute('data-msg-id') === emailPromptAfterMessageId; });
+    if (!anchor) anchor = rows[rows.length - 1];
+    emailPromptAfterMessageId = anchor ? anchor.getAttribute('data-msg-id') : '';
+    // 记录提示的位置，重连重绘历史时不要把它留在所有消息前面，也不要重复生成。
+    messagesEl.insertBefore(emailPromptEl, anchor ? anchor.nextSibling : null);
+  }
+
+  function insertGateCard() {
     if (stored.email) return; // 已经真正留过邮箱了，不用再问
     if (panel.querySelector('.ms-gate-card')) return; // 已经在展示了，不重复插入
     gateShownThisSession = true;
@@ -300,7 +332,7 @@
     card.innerHTML = `
       <h4>您的电子邮件地址是？</h4>
       <p>请输入您的电子邮件，以便我们及时回复您</p>
-      <input type="email" placeholder="输入您的电子邮件地址" />
+      <input type="email" maxlength="254" aria-label="电子邮件地址" placeholder="输入您的电子邮件地址" />
       <div class="ms-gate-err" style="display:none"></div>
       <div class="ms-gate-btns">
         <button class="ms-gate-skip" type="button">跳过</button>
@@ -316,7 +348,10 @@
     function dismiss() {
       if (card.parentNode) card.parentNode.removeChild(card);
     }
-    card.querySelector('.ms-gate-skip').onclick = dismiss;
+    card.querySelector('.ms-gate-skip').onclick = function () {
+      dismiss();
+      if (ensureEmailPrompt()) scrollMessagesToBottom();
+    };
     submitBtn.onclick = function () {
       var v = emailInput.value.trim();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) {
@@ -326,8 +361,11 @@
       }
       stored.email = v;
       safeSet(STORAGE_KEY, JSON.stringify(stored));
-      if (onDone) onDone(v);
-      if (card.parentNode) card.parentNode.removeChild(card);
+      if (socket) socket.emit('visitor_info', { email: v });
+      if (emailPromptEl && emailPromptEl.parentNode) emailPromptEl.parentNode.removeChild(emailPromptEl);
+      emailPromptEl = null;
+      emailPromptAfterMessageId = '';
+      dismiss();
     };
     emailInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitBtn.click(); });
     emailInput.addEventListener('focus', function () {
@@ -352,7 +390,7 @@
   var notificationAudioContext = null;
 
   function isConversationVisible() {
-    return isOpen && document.visibilityState !== 'hidden';
+    return isOpen && document.visibilityState !== 'hidden' && isNearMessageBottom();
   }
 
   function updateUnreadIndicators() {
@@ -445,17 +483,33 @@
     launcher.style.display = isOpen ? 'none' : 'flex';
     if (isOpen) {
       clearUnreadIndicators();
-      if (socket && socket.connected && isConversationVisible()) socket.emit('visitor_read');
       if (tagEl && tagEl.style.display !== 'none') {
         tagEl.style.display = 'none';
       }
       // 面板打开之前如果历史消息已经渲染好了，那时候面板是display:none的，
       // 设置scrollTop在隐藏元素上是无效的，所以每次真正打开的时候都要重新滚一次到底部
       scrollMessagesToBottom();
+      if (socket && socket.connected && isConversationVisible()) socket.emit('visitor_read');
     }
   }
 
-  // 等消息区里的图片都加载完（避免图片还没下载完就滚动，停的位置会差一截），再滚动到底部
+  var messageScrollRequest = 0;
+  function cancelPendingMessageScroll() { messageScrollRequest++; }
+  messagesEl.addEventListener('wheel', cancelPendingMessageScroll, { passive: true });
+  messagesEl.addEventListener('touchstart', cancelPendingMessageScroll, { passive: true });
+  messagesEl.addEventListener('pointerdown', cancelPendingMessageScroll, { passive: true });
+  messagesEl.addEventListener('keydown', cancelPendingMessageScroll);
+  function isNearMessageBottom() {
+    return messagesEl.scrollHeight - messagesEl.clientHeight - messagesEl.scrollTop < 64;
+  }
+  messagesEl.addEventListener('scroll', function () {
+    // 上翻菜单期间收到的消息先记为送达，真正回到底部才清除提示并标记已读。
+    if (unread <= 0 || !isConversationVisible()) return;
+    clearUnreadIndicators();
+    if (socket && socket.connected) socket.emit('visitor_read');
+  }, { passive: true });
+
+  // 等图片加载完再校正到底部；客户开始翻看菜单或历史时，取消尚未执行的校正。
   function waitForImagesThenScroll() {
     var imgs = Array.prototype.slice.call(messagesEl.querySelectorAll('img'));
     var wait = !imgs.length ? Promise.resolve() : Promise.race([
@@ -470,10 +524,20 @@
     return wait;
   }
   function scrollMessagesToBottom() {
+    var request = ++messageScrollRequest;
+    // 没有聊天记录时从菜单第一项开始展示，长菜单也不会默认停在最后一项。
+    if (!renderedMessageIds.size && !emailPromptEl) {
+      messagesEl.scrollTop = 0;
+      return;
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
     waitForImagesThenScroll().then(function () {
+      if (request !== messageScrollRequest) return;
       if (window.requestAnimationFrame) {
         requestAnimationFrame(function () {
-          requestAnimationFrame(function () { messagesEl.scrollTop = messagesEl.scrollHeight; });
+          requestAnimationFrame(function () {
+            if (request === messageScrollRequest) messagesEl.scrollTop = messagesEl.scrollHeight;
+          });
         });
       } else {
         messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -603,10 +667,7 @@
     return sameDay ? hm : (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm;
   }
 
-  // ---------- 菜单式引导：客户点选项，有子项就往下钻一层，没有就显示预设内容 ----------
-
-
-  // ---------- 菜单式引导：铺满整个消息区的列表，点击进下一层，顶部有返回按钮 ----------
+  // ---------- 菜单式引导：作为聊天记录顶部的内容保留，与消息共用同一个滚动区域 ----------
   var menuViewEl = document.getElementById('ms-menu-view');
   var menuStack = []; // 每层放 {items: [...]} 或 {answer: {title, content}}，栈顶是当前展示的层级
   function currentMenuLevel() {
@@ -622,6 +683,8 @@
       backBtn.onclick = function () {
         menuStack.pop();
         renderMenuView();
+        cancelPendingMessageScroll();
+        messagesEl.scrollTop = 0;
       };
       menuViewEl.appendChild(backBtn);
     }
@@ -648,6 +711,8 @@
             menuStack.push({ answer: { title: item.title, content: item.content } });
           }
           renderMenuView();
+          cancelPendingMessageScroll();
+          messagesEl.scrollTop = 0;
         };
         menuViewEl.appendChild(btn);
       });
@@ -655,13 +720,10 @@
   }
   function showMenuView() {
     if (!MENU_TREE.length) return;
-    menuStack = [];
     renderMenuView();
     menuViewEl.classList.add('show');
   }
-  function hideMenuView() {
-    menuViewEl.classList.remove('show');
-  }
+  showMenuView(); // 不依赖历史是否为空；发送消息、刷新和重连后都能往上翻到菜单。
 
   function parseQuotedMessage(text) {
     if (typeof text !== 'string' || text.charAt(0) !== '「') return null;
@@ -684,8 +746,9 @@
     container.appendChild(body);
   }
 
-  function renderMessage(m) {
+  function renderMessage(m, followLatest) {
     if (m && m.id && renderedMessageIds.has(m.id)) return false;
+    var shouldFollow = followLatest !== false && (!renderedMessageIds.size || m.sender === 'visitor' || isNearMessageBottom());
     if (m && m.id) renderedMessageIds.add(m.id);
     var row = document.createElement('div');
     row.className = 'ms-row' + (m.sender === 'visitor' ? ' me' : '');
@@ -716,7 +779,9 @@
     col.appendChild(timeEl);
     row.appendChild(col);
     messagesEl.appendChild(row);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    // 跳过邮箱框时消息回显可能尚未抵达，待第一条消息到达后再把提示放在其后。
+    if (emailPromptEl && !emailPromptAfterMessageId) positionEmailPrompt();
+    if (shouldFollow) scrollMessagesToBottom();
     return true;
   }
 
@@ -843,16 +908,23 @@
     });
 
     socket.on('history', function (msgs) {
+      var followLatest = !renderedMessageIds.size || isNearMessageBottom();
+      var previousScrollTop = messagesEl.scrollTop;
+      cancelPendingMessageScroll();
       Array.prototype.slice.call(messagesEl.querySelectorAll('.ms-row[data-msg-id]')).forEach(function (row) {
         if (row.parentNode) row.parentNode.removeChild(row);
       });
       renderedMessageIds.clear();
-      msgs.forEach(renderMessage);
+      msgs.forEach(function (m) { renderMessage(m, false); });
+      // 重新打开页面时，未留邮箱的老会话也保留填写入口，但不主动弹框打断阅读。
+      if (emailPromptEl || (!panel.querySelector('.ms-gate-card') && msgs.some(function (m) { return m.sender === 'visitor'; }))) {
+        ensureEmailPrompt();
+      }
+      if (followLatest) scrollMessagesToBottom();
+      else messagesEl.scrollTop = previousScrollTop;
       if (msgs.some(function (m) { return m.sender === 'agent'; })) {
         socket.emit(isConversationVisible() ? 'visitor_read' : 'visitor_delivered');
       }
-      if (!msgs.length && MENU_TREE.length) showMenuView();
-      scrollMessagesToBottom();
     });
 
     // 客服撤回了一条消息：如果这条消息已经在界面上显示出来了，直接移除
@@ -863,7 +935,6 @@
     });
 
     socket.on('new_message', function (m) {
-      hideMenuView();
       var appended = renderMessage(m);
       if (!appended) return;
       hideTyping();
@@ -911,7 +982,7 @@
       function attemptSend(attempt) {
         socket.timeout(10000).emit('visitor_message', payload, function (timeoutError, response) {
           if (!timeoutError && response && response.ok) return;
-          if (attempt < 2) {
+          if (attempt < 2 && !(response && (response.retryable === false || response.code === 'MESSAGE_TOO_LONG'))) {
             setTimeout(function () { attemptSend(attempt + 1); }, 450 + attempt * 700);
             return;
           }
@@ -920,13 +991,17 @@
       }
       attemptSend(0);
       if (!gateShownThisSession && !stored.email) {
-        insertGateCard(function (email) { socket.emit('visitor_info', { email: email }); });
+        insertGateCard();
       }
     }
 
     document.getElementById('ms-send').onclick = function () {
       var v = inputEl.value.trim();
       if (!v) return;
+      if (v.length > MAX_TEXT_LENGTH) {
+        showUploadError('消息不能超过 ' + MAX_TEXT_LENGTH + ' 个字符，请分段发送。');
+        return;
+      }
       send('text', v, null, null, function (message) {
         if (!inputEl.value.trim()) inputEl.value = v;
         showUploadError(message);
@@ -940,8 +1015,13 @@
     fileEl.addEventListener('change', function () {
       var f = fileEl.files[0];
       if (!f || !visitorSessionReady || attachmentUploading) return;
+      if (!/\.(jpe?g|png|webp|gif)$/i.test(f.name) || (f.type && !/^image\/(jpeg|png|webp|gif)$/i.test(f.type))) {
+        showUploadError('只能发送 JPG、PNG、WebP、GIF 图片');
+        fileEl.value = '';
+        return;
+      }
       if (f.size > 20 * 1024 * 1024) {
-        showUploadError('文件不能超过 20MB');
+        showUploadError('图片不能超过 20MB');
         fileEl.value = '';
         return;
       }

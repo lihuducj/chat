@@ -12,10 +12,10 @@ struct APIStatus: Decodable {
 struct Conversation: Identifiable, Codable, Hashable {
     let id: String
     let visitorId: String
-    let status: String
+    var status: String
     let createdAt: Int64
-    let lastMessageAt: Int64
-    let unreadCount: Int
+    var lastMessageAt: Int64
+    var unreadCount: Int
     let notes: String?
     let tags: String?
     let visitorDeliveredAt: Int64?
@@ -24,9 +24,9 @@ struct Conversation: Identifiable, Codable, Hashable {
     let visitorEmail: String?
     let visitorIP: String?
     let lastUrl: String?
-    let lastMessage: String?
-    let lastType: String?
-    let lastSender: String?
+    var lastMessage: String?
+    var lastType: String?
+    var lastSender: String?
 
     enum CodingKeys: String, CodingKey {
         case id, status, notes, tags
@@ -128,6 +128,12 @@ struct NativeEvent: Decodable, Hashable {
     let messageId: String?
     let message: ChatMessage?
     let eventId: Int64?
+    let conversation: Conversation?
+}
+
+struct InboxSnapshot {
+    let conversations: [Conversation]
+    let eventID: Int64?
 }
 
 struct UploadResponse: Decodable {

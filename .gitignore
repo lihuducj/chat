@@ -1,7 +1,10 @@
 server/data.sqlite
+server/.env
+.env
 server/data.sqlite-shm
 server/data.sqlite-wal
 server/uploads/*
+server/.upload-staging/
 !server/uploads/.gitkeep
 node_modules/
 .DS_Store

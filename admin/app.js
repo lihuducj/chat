@@ -1,5 +1,6 @@
 const SERVER = window.location.origin;
 const TOKEN_KEY = 'ms_token';
+const MAX_TEXT_LENGTH = 100000;
 let activeConvId = null;
 let conversations = [];
 let socket = null;
@@ -36,7 +37,7 @@ function sendAgentSocketMessage(payload, onFailure, attempt) {
   const currentAttempt = attempt || 0;
   socket.timeout(10000).emit('agent_message', payload, (timeoutError, response) => {
     if (!timeoutError && response && response.ok) return;
-    if (currentAttempt < 2) {
+    if (currentAttempt < 2 && !(response && response.code === 'MESSAGE_TOO_LONG')) {
       setTimeout(() => sendAgentSocketMessage(payload, onFailure, currentAttempt + 1), 450 + currentAttempt * 700);
       return;
     }
@@ -436,6 +437,7 @@ function scrollToBottom() {
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       chatMessages.scrollTop = chatMessages.scrollHeight;
+      if (activeConvId) markRead(activeConvId);
     });
   });
 }
@@ -478,12 +480,34 @@ if (window.visualViewport) {
   });
 }
 
-function markRead(convId) {
-  apiFetch('/api/conversations/' + convId + '/read', { method: 'POST' });
-  const c = conversations.find((x) => x.id === convId);
-  if (c) c.unread_count = 0;
-  renderConvList();
+const acknowledgedReadMessages = new Map();
+const pendingReadMessages = new Set();
+async function markRead(convId) {
+  if (convId !== activeConvId || document.hidden || !document.hasFocus()
+      || conversationLoadBuffer || !chatActive.getClientRects().length || !isChatNearBottom(8)) return;
+  const visitorRows = chatMessages.querySelectorAll('.msg-row:not(.agent)[data-msg-id]');
+  const newestVisitor = visitorRows[visitorRows.length - 1];
+  const throughMessageId = newestVisitor && newestVisitor.dataset.msgId;
+  if (!throughMessageId || acknowledgedReadMessages.get(convId) === throughMessageId
+      || pendingReadMessages.has(throughMessageId)) return;
+  pendingReadMessages.add(throughMessageId);
+  try {
+    const response = await apiFetch('/api/conversations/' + convId + '/read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ throughMessageId })
+    });
+    if (!response.ok) return;
+    acknowledgedReadMessages.set(convId, throughMessageId);
+    await loadConversations();
+  } catch (_) {
+    // Keep unread until the server acknowledges the visible message.
+  } finally {
+    pendingReadMessages.delete(throughMessageId);
+  }
 }
+chatMessages.addEventListener('scroll', () => { if (activeConvId) markRead(activeConvId); }, { passive: true });
+window.addEventListener('focus', () => { if (activeConvId) markRead(activeConvId); });
 
 // ---------- 标签 / 备注 ----------
 let currentTags = [];
@@ -1280,6 +1304,10 @@ function sendText() {
   if (!v || !activeConvId) return;
   const quoteSnapshot = quotedText;
   const content = quoteSnapshot ? `「${quoteSnapshot}」\n${v}` : v;
+  if (content.length > MAX_TEXT_LENGTH) {
+    alert(`消息连同引用不能超过 ${MAX_TEXT_LENGTH} 个字符，请分段发送。`);
+    return;
+  }
   const payload = {
     conversationId: activeConvId,
     type: 'text',
@@ -1609,7 +1637,7 @@ webPushBtn.onclick = async () => {
 
 // ---------- 启动：先确认登录，再建立Socket连接（Socket握手也带上token）----------
 function startSocket() {
-  socket = io(SERVER, { query: { role: 'agent', token: getToken() } });
+  socket = io(SERVER, { auth: { role: 'agent', token: getToken() } });
 
   socket.on('connect', async () => {
     connDot.classList.add('online');

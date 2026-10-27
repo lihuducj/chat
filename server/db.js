@@ -1,6 +1,8 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 
+// SQLite WAL/SHM files and future private uploads must not inherit a world-readable umask.
+process.umask(0o077);
 const db = new Database(path.join(__dirname, 'data.sqlite'));
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
@@ -90,6 +92,17 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT
 );
 
+-- New uploads are bound to their uploader. Old chat attachments remain intact.
+CREATE TABLE IF NOT EXISTS attachment_uploads (
+  url TEXT PRIMARY KEY,
+  actor TEXT NOT NULL,
+  visitor_id TEXT,
+  type TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  file_size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_last_message ON conversations(last_message_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_visitor ON conversations(visitor_id);
@@ -107,7 +120,7 @@ try {
 }
 
 // 访客身份不能只依赖可复制/可猜测的 visitorId。随机 secret 只保存在该访客浏览器里，
-// 服务端用两者共同验证历史会话归属。老数据库启动时自动补字段，旧访客下次连接时再安全生成。
+// 服务端用两者共同验证历史会话归属。没有凭据的旧记录不得仅凭 ID 认领。
 try {
   db.prepare('SELECT visitor_secret FROM visitors LIMIT 1').get();
 } catch (e) {

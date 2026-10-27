@@ -1,5 +1,109 @@
 import Foundation
 
+// One foreground inbox backs the list, the chat back button and the app badge.
+// A response captured before an SSE event must never overwrite that event.
+struct InboxState {
+    private(set) var conversations: [Conversation] = []
+    private(set) var revision: UInt64 = 0
+    private var snapshotEventID: Int64?
+    private var changes: [String: (revision: UInt64, eventID: Int64?)] = [:]
+    private var seenMessageIDs = Set<String>()
+    private var messageOrder: [String] = []
+
+    var unreadCount: Int { conversations.reduce(0) { $0 + max(0, $1.unreadCount) } }
+
+    func unreadCount(excluding id: String) -> Int {
+        conversations.filter { $0.id != id }.reduce(0) { $0 + max(0, $1.unreadCount) }
+    }
+
+    @discardableResult
+    mutating func apply(_ event: NativeEvent) -> Bool {
+        guard let id = event.conversationId else { return false }
+        if let eventID = event.eventId, let cursor = snapshotEventID, eventID <= cursor {
+            return false
+        }
+        switch event.type {
+        case "conversation_deleted":
+            conversations.removeAll { $0.id == id }
+        case "new_message":
+            guard let message = event.message, seenMessageIDs.insert(message.id).inserted else { return false }
+            messageOrder.append(message.id)
+            if messageOrder.count > 500 { seenMessageIDs.remove(messageOrder.removeFirst()) }
+            if let updated = event.conversation {
+                upsert(updated)
+            } else {
+                // Compatibility with servers that send only the message.
+                var row = conversations.first { $0.id == id } ?? Conversation(
+                    id: id, visitorId: "", status: "open", createdAt: message.createdAt,
+                    lastMessageAt: 0, unreadCount: 0, notes: nil, tags: nil,
+                    visitorDeliveredAt: nil, visitorReadAt: nil, visitorName: nil,
+                    visitorEmail: nil, visitorIP: nil, lastUrl: nil,
+                    lastMessage: nil, lastType: nil, lastSender: nil
+                )
+                guard message.createdAt > row.lastMessageAt else { return false }
+                row.lastMessageAt = message.createdAt
+                row.lastMessage = message.content
+                row.lastType = message.type
+                row.lastSender = message.sender
+                if message.sender == "visitor" {
+                    row.status = "open"
+                    row.unreadCount += 1
+                }
+                upsert(row)
+            }
+        case "conversation_updated", "message_recalled":
+            guard let updated = event.conversation else { return false }
+            upsert(updated)
+        default:
+            return false
+        }
+        revision += 1
+        changes[id] = (revision, event.eventId)
+        return true
+    }
+
+    mutating func merge(_ snapshot: InboxSnapshot, startedAt start: UInt64) {
+        if let cursor = snapshot.eventID, let current = snapshotEventID, cursor < current { return }
+        let previous = Dictionary(conversations.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+        func preserve(_ id: String) -> Bool {
+            guard let change = changes[id] else { return false }
+            if let cursor = snapshot.eventID, let eventID = change.eventID { return eventID > cursor }
+            return change.revision > start
+        }
+        var result: [Conversation] = []
+        var included = Set<String>()
+        for row in snapshot.conversations where included.insert(row.id).inserted {
+            if preserve(row.id) {
+                if let local = previous[row.id] { result.append(local) }
+                // A deletion received after the request is a tombstone.
+            } else {
+                result.append(row)
+            }
+        }
+        for row in conversations where !included.contains(row.id) && preserve(row.id) {
+            result.append(row)
+        }
+        let pendingChanges = changes.filter { preserve($0.key) }
+        conversations = result
+        changes = pendingChanges
+        if let cursor = snapshot.eventID { snapshotEventID = cursor }
+    }
+
+    mutating func remove(_ id: String) {
+        conversations.removeAll { $0.id == id }
+        revision += 1
+        changes[id] = (revision, nil)
+    }
+
+    private mutating func upsert(_ conversation: Conversation) {
+        if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
+            conversations[index] = conversation
+        } else {
+            conversations.append(conversation)
+        }
+    }
+}
+
 // Layout changes must not be confused with the user's decision to read history.
 struct ChatScrollState {
     private(set) var followsLatest = true

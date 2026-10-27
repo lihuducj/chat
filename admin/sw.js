@@ -1,8 +1,8 @@
-const CACHE = 'myservice-admin-v6';
+const CACHE = 'myservice-admin-v7';
 const SHELL = [
   './index.html',
   './style.css?v=20260829-2',
-  './app.js?v=20260829-2',
+  './app.js?v=20261027-1',
   './manifest.json'
 ];
 
