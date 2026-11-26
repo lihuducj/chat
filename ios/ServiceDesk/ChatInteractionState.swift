@@ -1,5 +1,31 @@
 import Foundation
 
+// Keep a navigation destination stable when live inbox fields change.
+struct ConversationRoute: Hashable {
+    let conversation: Conversation
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.conversation.id == rhs.conversation.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(conversation.id)
+    }
+}
+
+// Display state belongs to this chat screen, not the message or persistent store.
+struct MessageTimestampExpansion {
+    private var expandedIDs = Set<String>()
+
+    func contains(_ id: String) -> Bool { expandedIDs.contains(id) }
+
+    mutating func toggle(_ id: String) {
+        if !expandedIDs.insert(id).inserted { expandedIDs.remove(id) }
+    }
+
+    mutating func reset() { expandedIDs.removeAll() }
+}
+
 // One foreground inbox backs the list, the chat back button and the app badge.
 // A response captured before an SSE event must never overwrite that event.
 struct InboxState {

@@ -103,6 +103,23 @@ func inboxRow(_ id: String = "inbox-a", unread: Int = 0, time: Int64 = 1, text: 
                  visitorEmail: nil, visitorIP: nil, lastUrl: nil,
                  lastMessage: text, lastType: "text", lastSender: "visitor")
 }
+
+let routeBeforeUpdate = ConversationRoute(conversation: inboxRow(unread: 0, time: 1, text: "old"))
+let routeAfterUpdate = ConversationRoute(conversation: inboxRow(unread: 2, time: 5, text: "new"))
+expect(routeBeforeUpdate == routeAfterUpdate, "Live inbox changes must not change navigation identity")
+expect(Set([routeBeforeUpdate, routeAfterUpdate]).count == 1, "Navigation hashing uses the conversation ID")
+expect(routeBeforeUpdate != ConversationRoute(conversation: inboxRow("other")), "Different conversations have different routes")
+
+var timestamps = MessageTimestampExpansion()
+expect(!timestamps.contains("m1") && !timestamps.contains("m2"), "Timestamps default to time only")
+timestamps.toggle("m1")
+expect(timestamps.contains("m1") && !timestamps.contains("m2"), "Tapping expands just the selected timestamp")
+timestamps.toggle("m1")
+expect(!timestamps.contains("m1"), "A second tap collapses the timestamp")
+timestamps.toggle("m1")
+timestamps.toggle("m2")
+timestamps.reset()
+expect(!timestamps.contains("m1") && !timestamps.contains("m2"), "Reentering a chat resets expanded timestamps")
 func inboxEvent(_ row: Conversation, cursor: Int64, type: String = "new_message") -> NativeEvent {
     let message = ChatMessage(id: "event-\(cursor)", conversationId: row.id, sender: "visitor",
                               type: "text", content: row.lastMessage ?? "", fileName: nil,

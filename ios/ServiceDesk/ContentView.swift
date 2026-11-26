@@ -192,7 +192,10 @@ private struct ConversationListView: View {
     @State private var pendingDelete: Conversation?
     @State private var eventRefreshTask: Task<Void, Never>?
     @State private var loadSequence = 0
-    @State private var navigationPath: [Conversation] = []
+    @State private var navigationPath: [ConversationRoute] = []
+    @State private var navigationRevision = 0
+    @State private var lastReturnedAt: Date?
+    @State private var activeDeepLinkRequest: String?
     private var conversations: [Conversation] {
         guard !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return appState.inbox.conversations
@@ -236,9 +239,18 @@ private struct ConversationListView: View {
                 } else {
                     List {
                         ForEach(displayedConversations) { conversation in
-                            NavigationLink(value: conversation) {
-                                ConversationRow(conversation: conversation)
+                            Button {
+                                openConversationFromList(conversation)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    ConversationRow(conversation: conversation)
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .contentShape(Rectangle())
                             }
+                            .buttonStyle(.plain)
                             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                 Button(role: .destructive) {
                                     pendingDelete = conversation
@@ -271,9 +283,9 @@ private struct ConversationListView: View {
                 }
             }
             .navigationTitle("Chat")
-            .navigationDestination(for: Conversation.self) { conversation in
-                ChatView(conversation: conversation)
-                    .id(conversation.id)
+            .navigationDestination(for: ConversationRoute.self) { route in
+                ChatView(conversation: route.conversation)
+                    .id(route.conversation.id)
             }
             .searchable(text: $search, prompt: "搜索邮箱、标签、备注、消息")
             .toolbar {
@@ -357,24 +369,49 @@ private struct ConversationListView: View {
             .onChange(of: navigationPath.count) { count in
                 // 从聊天页返回列表时立即对账，不等下一轮 4 秒轮询。
                 guard count == 0 else { return }
+                // Invalidate any deep-link fetch started before the user went back.
+                navigationRevision += 1
+                lastReturnedAt = Date()
+                if let pendingID = appState.pendingConversationID,
+                   pendingID == activeDeepLinkRequest {
+                    appState.consumeConversationDeepLink(pendingID)
+                }
                 Task { await load(showSpinner: false) }
             }
             .onDisappear { eventRefreshTask?.cancel() }
         }
     }
 
+    private func openConversationFromList(_ conversation: Conversation) {
+        guard navigationPath.isEmpty else { return }
+        // Ignore a tap carried through the back transition, not later intentional taps.
+        if let lastReturnedAt, Date().timeIntervalSince(lastReturnedAt) < 0.35 { return }
+        navigationRevision += 1
+        if let pendingID = appState.pendingConversationID {
+            appState.consumeConversationDeepLink(pendingID)
+        }
+        navigationPath = [ConversationRoute(conversation: conversation)]
+    }
+
     private func openConversationFromDeepLink(_ conversationID: String) async {
         guard let client = appState.client else { return }
+        let revision = navigationRevision
+        activeDeepLinkRequest = conversationID
+        defer {
+            if activeDeepLinkRequest == conversationID { activeDeepLinkRequest = nil }
+        }
         do {
             let conversation = try await client.conversation(id: conversationID)
-            guard !Task.isCancelled, appState.pendingConversationID == conversationID else { return }
-            if navigationPath.last?.id != conversation.id {
-                navigationPath = [conversation]
+            guard !Task.isCancelled, revision == navigationRevision,
+                  appState.pendingConversationID == conversationID else { return }
+            if navigationPath.last?.conversation.id != conversation.id {
+                navigationPath = [ConversationRoute(conversation: conversation)]
             }
             appState.consumeConversationDeepLink(conversationID)
             errorMessage = nil
         } catch {
-            guard !Task.isCancelled, appState.pendingConversationID == conversationID else { return }
+            guard !Task.isCancelled, revision == navigationRevision,
+                  appState.pendingConversationID == conversationID else { return }
             appState.consumeConversationDeepLink(conversationID)
             appState.handleUnauthorized(error)
             errorMessage = "无法打开推送对应的会话：\(error.localizedDescription)"
@@ -540,6 +577,8 @@ private struct ChatView: View {
     @State private var showCamera = false
     @State private var showFileImporter = false
     @State private var composerPanel: ComposerPanel?
+    // Keep the last docked keyboard height so the tools panel can replace it.
+    @State private var lastKeyboardPanelHeight: CGFloat = 300
     @State private var showDetails = false
     @State private var visitorIsTyping = false
     @State private var pendingRecall: ChatMessage?
@@ -557,6 +596,8 @@ private struct ChatView: View {
     @State private var timelineLayout: ChatTimelineLayout?
     @State private var isChatVisible = false
     @State private var showExpandedText = false
+    @State private var messageForActions: ChatMessage?
+    @State private var timestampExpansion = MessageTimestampExpansion()
     @State private var isChangingStatus = false
     @State private var hasLoadedInitialMessages = false
     @State private var lastMarkedReadMessageID: String?
@@ -573,7 +614,7 @@ private struct ChatView: View {
         isChatVisible && scenePhase == .active
             && !showDetails && !showCamera && !showPhotoPicker && !showFileImporter
             && previewImageURL == nil && selectableText == nil
-            && !showExpandedText && pendingRecall == nil
+            && !showExpandedText && pendingRecall == nil && messageForActions == nil
     }
 
     init(conversation: Conversation) {
@@ -702,7 +743,7 @@ private struct ChatView: View {
                         )
                     }
                 }
-                .frame(height: 220)
+                .frame(height: composerPanel == .tools ? toolsPanelHeight : 220)
             }
         }
         .navigationTitle(liveConversation.displayName)
@@ -821,6 +862,9 @@ private struct ChatView: View {
                 composerPanel = nil
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { notification in
+            rememberDockedKeyboardHeight(from: notification)
+        }
         .confirmationDialog(
             "撤回这条消息？",
             isPresented: Binding(
@@ -842,6 +886,7 @@ private struct ChatView: View {
         }
         .onDisappear {
             isChatVisible = false
+            messageForActions = nil
             messageLoadSequence += 1
             conversationLoadSequence += 1
             scrollTask?.cancel()
@@ -852,6 +897,7 @@ private struct ChatView: View {
         }
         .onAppear {
             isChatVisible = true
+            timestampExpansion.reset()
             if draft.isEmpty {
                 draft = UserDefaults.standard.string(forKey: draftStorageKey) ?? ""
             }
@@ -884,6 +930,9 @@ private struct ChatView: View {
                             client: appState.client,
                             receipt: receiptState(for: message),
                             autoTranslate: appState.autoTranslateEnabled && !message.isAgent,
+                            showFullTimestamp: timestampExpansion.contains(message.id),
+                            onToggleTimestamp: { timestampExpansion.toggle(message.id) },
+                            onOpenActions: { messageForActions = message },
                             onImageTap: { previewImageURL = $0 },
                             onImageLoaded: {
                                 keepChatAtBottom(using: proxy)
@@ -960,6 +1009,20 @@ private struct ChatView: View {
                     .accessibilityHint("点按跳到最新消息")
                 }
             }
+            .overlay {
+                if let selected = messageForActions {
+                    ZStack(alignment: .bottom) {
+                        Color.black.opacity(0.12)
+                            .contentShape(Rectangle())
+                            .onTapGesture { messageForActions = nil }
+                        messageActionMenu(for: selected)
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 10)
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("消息操作")
+                }
+            }
             .onPreferenceChange(ChatTimelineLayoutKey.self) { layout in
                 guard let layout else { return }
                 let previousSize = timelineLayout?.frame.size
@@ -1004,6 +1067,101 @@ private struct ChatView: View {
             }
           }
         }
+    }
+
+    @ViewBuilder
+    private func messageActionMenu(for selected: ChatMessage) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text(selected.type == "text" ? selected.content : (selected.fileName ?? "消息"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer(minLength: 4)
+                Button { messageForActions = nil } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("关闭消息操作")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+            if selected.type == "text" && !selected.isRecalled {
+                Button {
+                    messageForActions = nil
+                    quotedText = selected.content
+                    composerFocused = true
+                } label: {
+                    Label("引用回复", systemImage: "arrowshape.turn.up.left")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+                Button {
+                    UIPasteboard.general.string = selected.content
+                    messageForActions = nil
+                    copyConfirmation = "已复制"
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        if copyConfirmation == "已复制" { copyConfirmation = nil }
+                    }
+                } label: {
+                    Label("复制全文", systemImage: "doc.on.doc")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+                Button {
+                    messageForActions = nil
+                    selectableText = SelectableTextContext(text: selected.content)
+                } label: {
+                    Label("选择部分文字", systemImage: "text.cursor")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+            }
+            if selected.isAgent && !selected.isRecalled && !selected.isPending {
+                Button(role: .destructive) {
+                    messageForActions = nil
+                    pendingRecall = selected
+                } label: {
+                    Label("撤回消息", systemImage: "arrow.uturn.backward")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: 300)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .shadow(color: .black.opacity(0.2), radius: 10, y: 4)
+    }
+
+    private var activeWindow: UIWindow? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .filter { $0.activationState == .foregroundActive }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)
+    }
+
+    private var toolsPanelHeight: CGFloat {
+        guard let window = activeWindow else { return lastKeyboardPanelHeight }
+        // Leave room for the composer and message list on small or rotated screens.
+        let available = max(160, window.bounds.height * 0.6 - window.safeAreaInsets.bottom)
+        return min(lastKeyboardPanelHeight, available)
+    }
+
+    private func rememberDockedKeyboardHeight(from notification: Notification) {
+        guard isChatVisible,
+              let window = activeWindow,
+              let screenFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let frame = window.convert(screenFrame, from: window.screen.coordinateSpace)
+        let overlap = window.bounds.intersection(frame)
+        // A dismissed or floating/split iPad keyboard does not define a bottom panel height.
+        guard !overlap.isNull, overlap.height > 100,
+              overlap.width >= window.bounds.width * 0.75,
+              abs(overlap.maxY - window.bounds.maxY) < 2 else { return }
+        lastKeyboardPanelHeight = max(160, overlap.height - window.safeAreaInsets.bottom)
     }
 
     private func toggleComposerPanel(_ panel: ComposerPanel) {
@@ -1784,6 +1942,9 @@ private struct MessageBubble: View {
     let client: APIClient?
     let receipt: MessageReceipt?
     let autoTranslate: Bool
+    let showFullTimestamp: Bool
+    let onToggleTimestamp: () -> Void
+    let onOpenActions: () -> Void
     let onImageTap: (URL) -> Void
     let onImageLoaded: () -> Void
     let onQuote: () -> Void
@@ -1791,6 +1952,18 @@ private struct MessageBubble: View {
     let onRecall: () -> Void
     let onPresentationChanged: (Bool) -> Void
     @State private var showFullText = false
+
+    private static let fullTimestamp: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy年M月d日 HH:mm"
+        return formatter
+    }()
+
+    private var hasMessageActions: Bool {
+        (message.type == "text" && !message.isRecalled)
+            || (message.isAgent && !message.isRecalled && !message.isPending)
+    }
 
     private var isLongText: Bool {
         guard message.type == "text", !message.isRecalled else { return false }
@@ -1864,7 +2037,14 @@ private struct MessageBubble: View {
                 .foregroundColor(message.isAgent && message.type == "text" && !message.isRecalled ? .white : .primary)
 
                 HStack(spacing: 4) {
-                    Text(DisplayFormatters.time.string(from: DisplayFormatters.date(milliseconds: message.createdAt)))
+                    Button(action: onToggleTimestamp) {
+                        Text((showFullTimestamp ? Self.fullTimestamp : DisplayFormatters.time)
+                            .string(from: DisplayFormatters.date(milliseconds: message.createdAt)))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(showFullTimestamp ? "完整日期和时间" : "消息时间")
+                    .accessibilityHint(showFullTimestamp ? "点按只显示时间" : "点按显示日期和时间")
                     if let receipt {
                         Text(receipt.symbol)
                             .fontWeight(.bold)
@@ -1876,26 +2056,13 @@ private struct MessageBubble: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             }
-            .contextMenu {
-                if message.type == "text" && !message.isRecalled {
-                    Button(action: onQuote) {
-                        Label("引用回复", systemImage: "arrowshape.turn.up.left")
-                    }
-                    Button {
-                        UIPasteboard.general.string = message.content
-                    } label: {
-                        Label("复制全文", systemImage: "doc.on.doc")
-                    }
-                    Button(action: onSelectText) {
-                        Label("选择部分文字", systemImage: "text.cursor")
-                    }
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                    guard hasMessageActions else { return }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onOpenActions()
                 }
-                if message.isAgent && !message.isRecalled && !message.isPending {
-                    Button(role: .destructive, action: onRecall) {
-                        Label("撤回消息", systemImage: "arrow.uturn.backward")
-                    }
-                }
-            }
+            )
             .sheet(isPresented: $showFullText) {
                 ExpandedMessageTextView(
                     message: message,
@@ -2054,7 +2221,14 @@ private struct SelectableUITextView: UIViewRepresentable {
     }
 }
 
-/// A native, selectable message body that recognizes web links without using a WebView.
+/// Message links remain tappable, but the message must not take first responder
+/// away from the composer when long-pressed. Partial selection uses the dedicated
+/// selection screen opened from the message action menu.
+private final class NonFocusingMessageTextView: UITextView {
+    override var canBecomeFirstResponder: Bool { false }
+}
+
+/// A native message body that recognizes web links without using a WebView.
 /// UITextView's data detector also recognizes common bare domains such as example.com.
 private struct LinkifiedSelectableText: UIViewRepresentable {
     let text: String
@@ -2065,7 +2239,7 @@ private struct LinkifiedSelectableText: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UITextView {
-        let view = UITextView()
+        let view = NonFocusingMessageTextView()
         view.delegate = context.coordinator
         view.isEditable = false
         view.isSelectable = true
